@@ -1,51 +1,72 @@
-# Roadmap — Kernel Engine
+# Roadmap — Ironclad
 
-This roadmap outlines phased development from pre-alpha through full release. Versions follow semantic versioning: alpha releases span 0.1.x through 0.4.x, beta begins at 0.5.x, and the first stable release is 1.0. Early phases prioritize concept validation and architectural correctness; later phases shift focus toward usability, reliability, and ecosystem growth.
+Development is organized into phased milestones from pre-alpha through stable release. Versions follow semantic versioning: alpha releases span 0.1.x through 0.5.x, beta begins at 0.6.x, and the first stable release is 1.0. Early phases prioritize architectural correctness and a working end-to-end pipeline; later phases expand the standard class library, harden the compiler, and deliver the full runtime model.
 
 ---
 
-## Phase 1 — Core Parser and Basic Compiler (0.1.x)
+## Phase 1 — Core Parser and Compiler Skeleton (0.1.x)
 
-- Define and formalize the Kernel Engine grammar specification.
-- Implement the core parser capable of tokenizing and validating Kernel Engine source files against the grammar.
-- Produce structured compiler output: syntax validation results, diagnostic logs, and parsed representation of the source tree.
-- No OS image generation at this stage — the objective is a correct, tested parser that accepts valid Kernel Engine code and rejects invalid input with clear error reporting.
+- Define and formalize the Ironclad grammar specification using pest (PEG).
+- Implement the core parser: tokenization, AST construction, and syntax validation against the grammar.
+- Implement the class resolution pass: inheritance flattening, property resolution, and origin tracking.
+- Produce structured compiler output: diagnostic logs, the resolved AST, and a human-readable representation of the flattened system declaration.
+- No backend emission at this stage. The objective is a correct, well-tested parser and resolver that accepts valid Ironclad source and rejects invalid input with precise, actionable error reporting.
 
-## Phase 2 — Proof of Concept (0.2.x)
+## Phase 2 — Backend Emission and Proof of Concept (0.2.x)
 
-- Generate a primitive bootable ISO from a Kernel Engine source file targeting a Fedora or AlmaLinux minimal base.
-- Validate the end-to-end pipeline: source file → parsed representation → system image containing declared partitions, bootloader, kernel parameters, init configuration, and basic services.
-- Output may be minimal and rough — the goal is to prove that the language-to-image compilation path is functional and architecturally sound.
+- Implement the intermediate manifest: CBOR serialization of the resolved AST, Ed25519 signing, and manifest verification.
+- Implement the bootc Containerfile emitter: generate a valid Containerfile from a declared system definition targeting a Fedora or AlmaLinux minimal base.
+- Implement the Kickstart emitter: generate a Kickstart configuration covering disk partitioning, LUKS2 encryption, LVM, TPM2/Clevis binding, bootloader installation, and kernel command-line parameters.
+- Validate the end-to-end build pipeline: Ironclad source → compiler → Containerfile + Kickstart → bootable installed system.
+- Ship the initial standard class library: `HardenedRHELBase`, `S6ContainerHost`, `SystemdServer`, and at minimum one SELinux MLS profile. Standard library classes must be written in Ironclad and fully inspectable.
 
-## Phase 3 — Object-Oriented Foundation (0.3.x)
+## Phase 3 — Semantic Validation (0.3.x)
 
-- Implement the class system: class definitions, instantiation, inheritance, and method/property resolution.
-- Introduce variables and parameterization to support fleet-wide variation from a shared source tree.
-- Enable rapid iteration on system definitions without raw repetition — users define base classes and extend or override for specific roles, hosts, or environments.
+- Implement the semantic validation pass with domain-aware rules: conflicting mount points, invalid SELinux label combinations, services declared without a corresponding init system, firewall rules referencing undeclared interfaces, security floor enforcement (SELinux enforcing mode required, LUKS2 required, minimum immutability).
+- Implement the nftables emitter: generate a complete nftables ruleset from declared network policy.
+- Implement init system emitters: s6 service tree generation and systemd unit file generation, selected by the declared init system.
+- Inheritance depth warnings and other compiler ergonomics.
 
-## Phase 4 — Auditability (0.4.x)
+## Phase 4 — SELinux MLS Policy Generation (0.4.x)
 
-- Implement runtime state comparison: read the live state of a deployed system and compare it against the declared source code that produced it.
-- Surface drift as structured output — identify which properties have changed, what the declared values are, and what the current live values are.
-- Lay the groundwork for continuous compliance workflows where deployed systems are periodically validated against their source definitions.
+- Implement the SELinux MLS policy generator: analyze the resolved AST system topology and generate `.te`, `.fc`, and `.if` policy files using the Reference Policy as a foundation.
+- Implement strictness levels: `baseline`, `standard`, `high`, and `maximum`, producing policies of graduated restrictiveness from the same declaration.
+- Implement manual override handling: preserve engineer-authored policy modifications across recompilation, flagging conflicts when declaration changes invalidate existing overrides.
+- Validate generated policy against declared topology for internal consistency before emission.
+- Ship additional standard library SELinux profiles covering common server roles.
 
-## Beta — Maturity and Stability (0.5.x+)
+## Phase 5 — Runtime Agent and Drift Detection (0.5.x)
 
-- Develop and publish robust standard class libraries for common system configurations: hardened server bases, desktop environments, network services, and security postures including SELinux policy profiles.
-- Harden the compiler and runtime against edge cases, malformed input, and adversarial configurations.
-- Reduce the amount of manual declaration required for typical builds by providing well-tested, composable classes — without sacrificing the ability to override any default at any layer.
+- Implement the Ironclad runtime agent in Rust: manifest reading and verification, live state comparison, structured drift reporting (JSON to configurable sinks).
+- Define the checked property set: file content hashes and permissions, user accounts and group memberships, running service states, loaded firewall rules, active SELinux labels on monitored paths.
+- Embed the agent in images at build time via the Containerfile emitter.
+- Implement post-maintenance verification: triggered agent comparison after Ansible playbook application, convergence reporting.
+- No remediation in the agent — detection and reporting only.
+
+## Phase 6 — Runtime Maintenance (0.6.x / Beta)
+
+- Implement the AST delta engine: accept two Ironclad source trees (or two Git refs) and produce a structured diff at the AST level.
+- Implement the Ansible playbook emitter: translate AST deltas into idempotent Ansible playbooks using standard modules (ansible.builtin.*, ansible.posix.*).
+- Validate the maintenance pipeline: declaration change → compiler delta → generated playbook → agent verification.
+- Implement the osbuild blueprint emitter as an alternative image backend for air-gapped and bare-metal environments where bootc is not available.
+- Harden the compiler and agent against edge cases, malformed input, and adversarial configurations.
 
 ## Full Release (1.0)
 
-- Deliver a mature, auditable, declarative Linux build system capable of producing reproducible systems across desktop and server workloads.
-- Comprehensive documentation, stable grammar specification, and a tested standard class library.
-- The compiler and runtime are considered production-grade for the supported target distributions (Fedora, AlmaLinux).
+- Complete, production-grade compiler covering all validation passes and all first-class backends (bootc, Kickstart, nftables, SELinux MLS, s6/systemd, Ansible delta).
+- Runtime agent stable and suitable for production deployment.
+- Comprehensive standard class library covering hardened server bases, SELinux MLS profiles for common workloads, container host configurations, and network service roles.
+- Complete documentation: language reference, grammar specification, class authoring guide, backend integration guide, runtime agent configuration.
+- The compiler and runtime are considered production-grade for Fedora and AlmaLinux targets.
 
 ## Post-1.0
 
-- Community-driven expansion: additional distribution targets (Debian, Arch, and others), desktop and server cluster support, and update/iteration mechanisms for managing deployed fleets over time.
-- Explore integration points with external orchestration and trust verification tooling as the ecosystem matures.
+- Additional distribution targets: Debian and Arch are the likely first candidates, requiring new backend emitters for apt-based package management and distribution-specific conventions.
+- Community class repository: a curated index of contributed Ironclad class libraries for sharing and discovering reusable system definitions.
+- Fleet topology primitives: declarations spanning multiple hosts with cluster-aware validation (network reachability, service dependency graphs across nodes).
+- Expanded output adapters: cloud-init compatibility for cloud deployments, Terraform provider for infrastructure-as-code integration.
+- RHEL proper support when resources permit.
 
 ---
 
-Early phases prioritize concept validation; later ones focus on usability and ecosystem.
+Early phases prioritize a correct, working end-to-end pipeline over feature breadth. Later phases build on that foundation with the full semantic validation, SELinux generation, and runtime model that define Ironclad's identity.
