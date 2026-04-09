@@ -82,18 +82,34 @@ fn main() {
         println!("{file_ast:#?}");
     } else {
         let decl_count = file_ast.declarations.len();
-        let disk_count = file_ast
-            .declarations
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        let types: &[(&str, fn(&&ast::StorageDecl) -> bool)] = &[
+            ("disk", |d| matches!(d, ast::StorageDecl::Disk(_))),
+            ("mdraid", |d| matches!(d, ast::StorageDecl::MdRaid(_))),
+            ("zpool", |d| matches!(d, ast::StorageDecl::Zpool(_))),
+            ("stratis", |d| matches!(d, ast::StorageDecl::Stratis(_))),
+            ("multipath", |d| matches!(d, ast::StorageDecl::Multipath(_))),
+            ("iscsi", |d| matches!(d, ast::StorageDecl::Iscsi(_))),
+            ("nfs", |d| matches!(d, ast::StorageDecl::Nfs(_))),
+            ("tmpfs", |d| matches!(d, ast::StorageDecl::Tmpfs(_))),
+        ];
+        for (name, pred) in types {
+            let c = file_ast.declarations.iter().filter(pred).count();
+            if c > 0 {
+                counts.push((name, c));
+            }
+        }
+        let detail = counts
             .iter()
-            .filter(|d| matches!(d, ast::StorageDecl::Disk(_)))
-            .count();
-        let mdraid_count = file_ast
-            .declarations
-            .iter()
-            .filter(|d| matches!(d, ast::StorageDecl::MdRaid(_)))
-            .count();
-
-        println!("ok: parsed {decl_count} declaration(s) ({disk_count} disk, {mdraid_count} mdraid)");
+            .map(|(n, c)| format!("{c} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let selinux_note = if file_ast.selinux.is_some() {
+            " + selinux"
+        } else {
+            ""
+        };
+        println!("ok: parsed {decl_count} declaration(s) ({detail}{selinux_note})");
         if !warnings.is_empty() {
             println!("   {} warning(s)", warnings.len());
         }

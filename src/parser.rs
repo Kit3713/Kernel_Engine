@@ -18,14 +18,24 @@ pub fn parse_storage(input: &str) -> Result<StorageFile> {
     })?;
 
     let mut declarations = Vec::new();
+    let mut selinux = None;
     for pair in pairs {
         match pair.as_rule() {
             Rule::file => {
                 for inner in pair.into_inner() {
                     match inner.as_rule() {
-                        Rule::storage_decl => {
-                            let decl = parse_storage_decl(inner, input)?;
-                            declarations.push(decl);
+                        Rule::top_level_decl => {
+                            let child = inner.into_inner().next().unwrap();
+                            match child.as_rule() {
+                                Rule::storage_decl => {
+                                    let decl = parse_storage_decl(child, input)?;
+                                    declarations.push(decl);
+                                }
+                                Rule::selinux_block => {
+                                    selinux = Some(parse_selinux_block(child, input)?);
+                                }
+                                _ => {}
+                            }
                         }
                         Rule::EOI => {}
                         _ => {}
@@ -36,7 +46,10 @@ pub fn parse_storage(input: &str) -> Result<StorageFile> {
         }
     }
 
-    Ok(StorageFile { declarations })
+    Ok(StorageFile {
+        declarations,
+        selinux,
+    })
 }
 
 fn make_span(pair: &pest::iterators::Pair<'_, Rule>, input: &str) -> Span {
@@ -77,6 +90,12 @@ fn parse_storage_decl(
     match inner.as_rule() {
         Rule::disk_block => Ok(StorageDecl::Disk(parse_disk_block(inner, input)?)),
         Rule::mdraid_block => Ok(StorageDecl::MdRaid(parse_mdraid_block(inner, input)?)),
+        Rule::zpool_block => Ok(StorageDecl::Zpool(parse_zpool_block(inner, input)?)),
+        Rule::stratis_block => Ok(StorageDecl::Stratis(parse_stratis_block(inner, input)?)),
+        Rule::multipath_block => Ok(StorageDecl::Multipath(parse_multipath_block(inner, input)?)),
+        Rule::iscsi_block => Ok(StorageDecl::Iscsi(parse_iscsi_block(inner, input)?)),
+        Rule::nfs_block => Ok(StorageDecl::Nfs(parse_nfs_block(inner, input)?)),
+        Rule::tmpfs_block => Ok(StorageDecl::Tmpfs(parse_tmpfs_block(inner, input)?)),
         _ => Err(IroncladError::ParseError {
             message: format!("unexpected rule: {:?}", inner.as_rule()),
             span: Some(make_span(&inner, input)),
@@ -125,6 +144,7 @@ fn parse_partition_child(
     match pair.as_rule() {
         Rule::fs_block => Ok(PartitionChild::Filesystem(parse_fs_block(pair, input)?)),
         Rule::luks_block => Ok(PartitionChild::Luks(parse_luks_block(pair, input)?)),
+        Rule::integrity_block => Ok(PartitionChild::Integrity(parse_integrity_block(pair, input)?)),
         Rule::lvm_block => Ok(PartitionChild::Lvm(parse_lvm_block(pair, input)?)),
         Rule::raw_block => Ok(PartitionChild::Raw(parse_raw_block(pair, input)?)),
         Rule::swap_block => Ok(PartitionChild::Swap(parse_swap_block(pair, input)?)),
@@ -155,24 +175,7 @@ fn parse_mdraid_block(
             Rule::property => properties.push(parse_property(item, input)?),
             Rule::mdraid_child => {
                 let child_inner = item.into_inner().next().unwrap();
-                match child_inner.as_rule() {
-                    Rule::fs_block => children.push(PartitionChild::Filesystem(
-                        parse_fs_block(child_inner, input)?,
-                    )),
-                    Rule::luks_block => children.push(PartitionChild::Luks(
-                        parse_luks_block(child_inner, input)?,
-                    )),
-                    Rule::lvm_block => children.push(PartitionChild::Lvm(
-                        parse_lvm_block(child_inner, input)?,
-                    )),
-                    Rule::raw_block => children.push(PartitionChild::Raw(
-                        parse_raw_block(child_inner, input)?,
-                    )),
-                    Rule::swap_block => children.push(PartitionChild::Swap(
-                        parse_swap_block(child_inner, input)?,
-                    )),
-                    _ => {}
-                }
+                children.push(parse_partition_child(child_inner, input)?);
             }
             _ => {}
         }
@@ -349,6 +352,9 @@ fn parse_lvm_block(
                     }
                     Rule::thin_block => {
                         children.push(LvmChild::Thin(parse_thin_block(child_inner, input)?))
+                    }
+                    Rule::vdo_block => {
+                        children.push(LvmChild::Vdo(parse_vdo_block(child_inner, input)?))
                     }
                     _ => {}
                 }
@@ -561,6 +567,15 @@ fn parse_property(
     let value_pair = inner.next().unwrap();
     let value = parse_value(value_pair, input)?;
 
+    // A bare path like `/exports/data` matches mount_expr in the grammar.
+    // If the key isn't "mount" and the mount has no options/context, demote to Path.
+    let value = match value {
+        Value::Mount(ref m) if key != "mount" && m.options.is_empty() && m.context.is_none() => {
+            Value::Path(m.target.clone())
+        }
+        other => other,
+    };
+
     Ok(Property { key, value, span })
 }
 
@@ -703,6 +718,355 @@ fn parse_size_str(s: &str) -> Result<(u64, SizeUnit)> {
         }
     };
     Ok((amount, unit))
+}
+
+// ─── Integrity ──────────────────────────────────────────────
+
+fn parse_integrity_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<IntegrityBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut children = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::integrity_child => {
+                let c = item.into_inner().next().unwrap();
+                match c.as_rule() {
+                    Rule::fs_block => children.push(IntegrityChild::Filesystem(parse_fs_block(c, input)?)),
+                    Rule::lvm_block => children.push(IntegrityChild::Lvm(parse_lvm_block(c, input)?)),
+                    Rule::swap_block => children.push(IntegrityChild::Swap(parse_swap_block(c, input)?)),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(IntegrityBlock { name, properties, children, span })
+}
+
+// ─── VDO ─────────────────────────────────────────────────────
+
+fn parse_vdo_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<VdoBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut children = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::vdo_child => {
+                let c = item.into_inner().next().unwrap();
+                match c.as_rule() {
+                    Rule::fs_block => children.push(VdoChild::Filesystem(parse_fs_block(c, input)?)),
+                    Rule::swap_block => children.push(VdoChild::Swap(parse_swap_block(c, input)?)),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(VdoBlock { name, properties, children, span })
+}
+
+// ─── ZFS Pool ────────────────────────────────────────────────
+
+fn parse_zpool_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<ZpoolBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut vdevs = Vec::new();
+    let mut datasets = Vec::new();
+    let mut zvols = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::vdev_block => vdevs.push(parse_vdev_block(item, input)?),
+            Rule::dataset_block => datasets.push(parse_dataset_block(item, input)?),
+            Rule::zvol_block => zvols.push(parse_zvol_block(item, input)?),
+            _ => {}
+        }
+    }
+    Ok(ZpoolBlock { name, properties, vdevs, datasets, zvols, span })
+}
+
+fn parse_vdev_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<VdevBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let mut properties = Vec::new();
+    for item in inner {
+        if item.as_rule() == Rule::property {
+            properties.push(parse_property(item, input)?);
+        }
+    }
+    Ok(VdevBlock { name, properties, span })
+}
+
+fn parse_dataset_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<DatasetBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut children = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::dataset_block => children.push(parse_dataset_block(item, input)?),
+            _ => {}
+        }
+    }
+    Ok(DatasetBlock { name, properties, children, span })
+}
+
+fn parse_zvol_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<ZvolBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut children = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::swap_block => children.push(ZvolChild::Swap(parse_swap_block(item, input)?)),
+            Rule::fs_block => children.push(ZvolChild::Filesystem(parse_fs_block(item, input)?)),
+            Rule::luks_block => children.push(ZvolChild::Luks(parse_luks_block(item, input)?)),
+            _ => {}
+        }
+    }
+    Ok(ZvolBlock { name, properties, children, span })
+}
+
+// ─── Stratis ─────────────────────────────────────────────────
+
+fn parse_stratis_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<StratisBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut filesystems = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::stratis_fs_block => filesystems.push(parse_stratis_fs(item, input)?),
+            _ => {}
+        }
+    }
+    Ok(StratisBlock { name, properties, filesystems, span })
+}
+
+fn parse_stratis_fs(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<StratisFilesystem> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut mount_block = None;
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::mount_block_ext => mount_block = Some(parse_mount_block_ext(item, input)?),
+            _ => {}
+        }
+    }
+    Ok(StratisFilesystem { name, properties, mount_block, span })
+}
+
+// ─── Multipath ───────────────────────────────────────────────
+
+fn parse_multipath_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<MultipathBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut paths = Vec::new();
+    let mut children = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::path_block => paths.push(parse_path_block(item, input)?),
+            Rule::multipath_child => {
+                let c = item.into_inner().next().unwrap();
+                children.push(parse_partition_child(c, input)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(MultipathBlock { name, properties, paths, children, span })
+}
+
+fn parse_path_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<PathBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let device = inner.next().unwrap().as_str().to_string();
+    let mut properties = Vec::new();
+    for item in inner {
+        if item.as_rule() == Rule::property {
+            properties.push(parse_property(item, input)?);
+        }
+    }
+    Ok(PathBlock { device, properties, span })
+}
+
+// ─── iSCSI ───────────────────────────────────────────────────
+
+fn parse_iscsi_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<IscsiBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut children = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::iscsi_child => {
+                let c = item.into_inner().next().unwrap();
+                children.push(parse_partition_child(c, input)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(IscsiBlock { name, properties, children, span })
+}
+
+// ─── NFS ─────────────────────────────────────────────────────
+
+fn parse_nfs_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<NfsBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut mount_block = None;
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::mount_block_ext => mount_block = Some(parse_mount_block_ext(item, input)?),
+            _ => {}
+        }
+    }
+    Ok(NfsBlock { name, properties, mount_block, span })
+}
+
+// ─── tmpfs ───────────────────────────────────────────────────
+
+fn parse_tmpfs_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<TmpfsBlock> {
+    let span = make_span(&pair, input);
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let body = inner.next().unwrap();
+    let mut properties = Vec::new();
+    let mut mount_block = None;
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::mount_block_ext => mount_block = Some(parse_mount_block_ext(item, input)?),
+            _ => {}
+        }
+    }
+    Ok(TmpfsBlock { name, properties, mount_block, span })
+}
+
+// ─── SELinux System Block ────────────────────────────────────
+
+fn parse_selinux_block(
+    pair: pest::iterators::Pair<'_, Rule>,
+    input: &str,
+) -> Result<SelinuxBlock> {
+    let span = make_span(&pair, input);
+    let body = pair.into_inner().next().unwrap();
+    let mut properties = Vec::new();
+    let mut users = Vec::new();
+    let mut roles = Vec::new();
+    let mut booleans = Vec::new();
+    for item in body.into_inner() {
+        match item.as_rule() {
+            Rule::property => properties.push(parse_property(item, input)?),
+            Rule::selinux_user_block => {
+                let s = make_span(&item, input);
+                let mut inner = item.into_inner();
+                let name = inner.next().unwrap().as_str().to_string();
+                let mut props = Vec::new();
+                for p in inner {
+                    if p.as_rule() == Rule::property {
+                        props.push(parse_property(p, input)?);
+                    }
+                }
+                users.push(SelinuxUserDecl { name, properties: props, span: s });
+            }
+            Rule::selinux_role_block => {
+                let s = make_span(&item, input);
+                let mut inner = item.into_inner();
+                let name = inner.next().unwrap().as_str().to_string();
+                let mut props = Vec::new();
+                for p in inner {
+                    if p.as_rule() == Rule::property {
+                        props.push(parse_property(p, input)?);
+                    }
+                }
+                roles.push(SelinuxRoleDecl { name, properties: props, span: s });
+            }
+            Rule::selinux_booleans_block => {
+                for p in item.into_inner() {
+                    if p.as_rule() == Rule::property {
+                        booleans.push(parse_property(p, input)?);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(SelinuxBlock { properties, users, roles, booleans, span })
 }
 
 // ─── Mount Expression (inline) ───────────────────────────────

@@ -1,11 +1,40 @@
-// Ironclad Storage Syntax — PEG Grammar (pest)
-// Phase 1: Full storage declaration parsing
+// Ironclad Storage + SELinux Syntax — PEG Grammar (pest)
+// Phase 1: Full storage and SELinux declaration parsing
 
 // ─── Top Level ───────────────────────────────────────────────
 
-file = { SOI ~ NEWLINE* ~ (storage_decl ~ NEWLINE*)* ~ EOI }
+file = { SOI ~ NEWLINE* ~ (top_level_decl ~ NEWLINE*)* ~ EOI }
 
-storage_decl = { disk_block | mdraid_block }
+top_level_decl = {
+    storage_decl | selinux_block
+}
+
+storage_decl = {
+    disk_block | mdraid_block | zpool_block | stratis_block
+    | multipath_block | iscsi_block | nfs_block | tmpfs_block
+}
+
+// ─── SELinux System Block ────────────────────────────────────
+
+selinux_block = {
+    "selinux" ~ "{" ~ selinux_body ~ "}"
+}
+
+selinux_body = {
+    (property | selinux_user_block | selinux_role_block | selinux_booleans_block)*
+}
+
+selinux_user_block = {
+    "user" ~ ident ~ "{" ~ property* ~ "}"
+}
+
+selinux_role_block = {
+    "role" ~ ident ~ "{" ~ property* ~ "}"
+}
+
+selinux_booleans_block = {
+    "booleans" ~ "{" ~ property* ~ "}"
+}
 
 // ─── Disk Block ──────────────────────────────────────────────
 
@@ -18,7 +47,7 @@ disk_body = {
 }
 
 partition_child = {
-    fs_block | luks_block | lvm_block | raw_block | swap_block
+    fs_block | luks_block | integrity_block | lvm_block | raw_block | swap_block
 }
 
 // ─── mdraid Block ────────────────────────────────────────────
@@ -32,7 +61,107 @@ mdraid_body = {
 }
 
 mdraid_child = {
-    fs_block | luks_block | lvm_block | raw_block | swap_block
+    fs_block | luks_block | integrity_block | lvm_block | raw_block | swap_block
+}
+
+// ─── ZFS Pool Block ──────────────────────────────────────────
+
+zpool_block = {
+    "zpool" ~ ident ~ "{" ~ zpool_body ~ "}"
+}
+
+zpool_body = {
+    (property | vdev_block | dataset_block | zvol_block)*
+}
+
+vdev_block = {
+    "vdev" ~ ident ~ "{" ~ property* ~ "}"
+}
+
+dataset_block = {
+    "dataset" ~ ident ~ "{" ~ dataset_body ~ "}"
+}
+
+dataset_body = {
+    (property | dataset_block)*
+}
+
+zvol_block = {
+    "zvol" ~ ident ~ "{" ~ zvol_body ~ "}"
+}
+
+zvol_body = {
+    (property | swap_block | fs_block | luks_block)*
+}
+
+// ─── Stratis Block ───────────────────────────────────────────
+
+stratis_block = {
+    "stratis" ~ ident ~ "{" ~ stratis_body ~ "}"
+}
+
+stratis_body = {
+    (property | stratis_fs_block)*
+}
+
+stratis_fs_block = {
+    "filesystem" ~ ident ~ "{" ~ stratis_fs_body ~ "}"
+}
+
+stratis_fs_body = {
+    (property | mount_block_ext)*
+}
+
+// ─── Multipath Block ─────────────────────────────────────────
+
+multipath_block = {
+    "multipath" ~ ident ~ "{" ~ multipath_body ~ "}"
+}
+
+multipath_body = {
+    (property | path_block | multipath_child)*
+}
+
+path_block = {
+    "path" ~ device_path ~ "{" ~ property* ~ "}"
+}
+
+multipath_child = {
+    fs_block | luks_block | integrity_block | lvm_block | raw_block | swap_block
+}
+
+// ─── iSCSI Block ─────────────────────────────────────────────
+
+iscsi_block = {
+    "iscsi" ~ ident ~ "{" ~ iscsi_body ~ "}"
+}
+
+iscsi_body = {
+    (property | iscsi_child)*
+}
+
+iscsi_child = {
+    fs_block | luks_block | integrity_block | lvm_block | raw_block
+}
+
+// ─── NFS Block ───────────────────────────────────────────────
+
+nfs_block = {
+    "nfs" ~ ident ~ "{" ~ nfs_body ~ "}"
+}
+
+nfs_body = {
+    (property | mount_block_ext)*
+}
+
+// ─── tmpfs Block ─────────────────────────────────────────────
+
+tmpfs_block = {
+    "tmpfs" ~ ident ~ "{" ~ tmpfs_body ~ "}"
+}
+
+tmpfs_body = {
+    (property | mount_block_ext)*
 }
 
 // ─── LUKS Blocks ─────────────────────────────────────────────
@@ -51,6 +180,20 @@ luks_child = {
     fs_block | lvm_block | swap_block
 }
 
+// ─── Integrity Block ─────────────────────────────────────────
+
+integrity_block = {
+    "integrity" ~ ident ~ "{" ~ integrity_body ~ "}"
+}
+
+integrity_body = {
+    (property | integrity_child)*
+}
+
+integrity_child = {
+    fs_block | lvm_block | swap_block
+}
+
 // ─── LVM Block ───────────────────────────────────────────────
 
 lvm_block = {
@@ -62,7 +205,7 @@ lvm_body = {
 }
 
 lvm_child = {
-    fs_block | swap_block | thin_block
+    fs_block | swap_block | thin_block | vdo_block
 }
 
 // ─── Thin Pool Block ─────────────────────────────────────────
@@ -76,6 +219,20 @@ thin_body = {
 }
 
 thin_child = {
+    fs_block | swap_block
+}
+
+// ─── VDO Block ───────────────────────────────────────────────
+
+vdo_block = {
+    "vdo" ~ ident ~ "{" ~ vdo_body ~ "}"
+}
+
+vdo_body = {
+    (property | vdo_child)*
+}
+
+vdo_child = {
     fs_block | swap_block
 }
 
@@ -252,7 +409,7 @@ url_string = @{
 }
 
 array_value = {
-    "[" ~ array_item ~ ("," ~ array_item)* ~ "]"
+    "[" ~ (array_item ~ ("," ~ array_item)*)? ~ "]"
 }
 
 array_item = {

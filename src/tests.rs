@@ -829,3 +829,682 @@ disk /dev/sda {
         }
     }
 }
+
+// ─── ZFS Pool ───────────────────────────────────────────────
+
+#[test]
+fn parse_zpool_basic() {
+    let input = r#"
+zpool tank {
+    ashift = 12
+    compression = lz4
+
+    vdev data0 {
+        type = mirror
+        members = [/dev/sda, /dev/sdb]
+    }
+
+    dataset root {
+        mountpoint = /tank
+        quota = 100G
+    }
+
+    zvol swap_vol {
+        size = 16G
+        blocksize = 8K
+
+        swap zswap {}
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 1);
+
+    if let StorageDecl::Zpool(zp) = &ast.declarations[0] {
+        assert_eq!(zp.name, "tank");
+        assert_eq!(zp.vdevs.len(), 1);
+        assert_eq!(zp.vdevs[0].name, "data0");
+        assert_eq!(zp.datasets.len(), 1);
+        assert_eq!(zp.datasets[0].name, "root");
+        assert_eq!(zp.zvols.len(), 1);
+        assert_eq!(zp.zvols[0].name, "swap_vol");
+    } else {
+        panic!("expected zpool");
+    }
+}
+
+#[test]
+fn parse_zpool_nested_datasets() {
+    let input = r#"
+zpool data {
+    vdev stripe0 {
+        type = stripe
+        members = [/dev/sda]
+    }
+
+    dataset home {
+        mountpoint = /home
+
+        dataset alice {
+            quota = 50G
+        }
+
+        dataset bob {
+            quota = 50G
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    if let StorageDecl::Zpool(zp) = &ast.declarations[0] {
+        assert_eq!(zp.datasets.len(), 1);
+        assert_eq!(zp.datasets[0].children.len(), 2);
+        assert_eq!(zp.datasets[0].children[0].name, "alice");
+        assert_eq!(zp.datasets[0].children[1].name, "bob");
+    } else {
+        panic!("expected zpool");
+    }
+}
+
+#[test]
+fn validate_zpool_vdev_member_count() {
+    let input = r#"
+zpool bad {
+    vdev m0 {
+        type = mirror
+        members = [/dev/sda]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "mirror with 1 member should fail");
+}
+
+#[test]
+fn validate_zpool_zvol_requires_size() {
+    let input = r#"
+zpool pool0 {
+    vdev v0 {
+        type = stripe
+        members = [/dev/sda]
+    }
+
+    zvol myvol {
+        blocksize = 8K
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "zvol without size should fail");
+}
+
+// ─── Stratis ────────────────────────────────────────────────
+
+#[test]
+fn parse_stratis_basic() {
+    let input = r#"
+stratis mypool {
+    disks = [/dev/sda, /dev/sdb]
+    encrypted = true
+
+    filesystem data {
+        size_limit = 500G
+
+        mount {
+            target = /srv/data
+            options = [nodev, nosuid]
+        }
+    }
+
+    filesystem logs {
+        size_limit = 50G
+
+        mount {
+            target = /var/log
+            options = [nodev, nosuid, noexec]
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 1);
+
+    if let StorageDecl::Stratis(s) = &ast.declarations[0] {
+        assert_eq!(s.name, "mypool");
+        assert_eq!(s.filesystems.len(), 2);
+        assert_eq!(s.filesystems[0].name, "data");
+        assert_eq!(s.filesystems[1].name, "logs");
+        assert!(s.filesystems[0].mount_block.is_some());
+    } else {
+        panic!("expected stratis");
+    }
+}
+
+#[test]
+fn validate_stratis_requires_disks() {
+    let input = r#"
+stratis nopool {
+    encrypted = true
+
+    filesystem fs0 {
+        mount {
+            target = /mnt/data
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "stratis without disks should fail");
+}
+
+// ─── Multipath ──────────────────────────────────────────────
+
+#[test]
+fn parse_multipath_basic() {
+    let input = r#"
+multipath san0 {
+    wwid = "3600508b1001c5a7380000300000e0000"
+    policy = round-robin
+
+    path /dev/sda {
+        priority = 1
+    }
+
+    path /dev/sdb {
+        priority = 2
+    }
+
+    luks2 encrypted_san {
+        cipher = aes-xts-plain64
+
+        lvm vg_san {
+            xfs san_data {
+                size = remaining
+                mount = /srv/san
+            }
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 1);
+
+    if let StorageDecl::Multipath(mp) = &ast.declarations[0] {
+        assert_eq!(mp.name, "san0");
+        assert_eq!(mp.paths.len(), 2);
+        assert_eq!(mp.paths[0].device, "/dev/sda");
+        assert_eq!(mp.children.len(), 1);
+    } else {
+        panic!("expected multipath");
+    }
+}
+
+#[test]
+fn validate_multipath_requires_wwid() {
+    let input = r#"
+multipath bad_mp {
+    policy = round-robin
+
+    path /dev/sda {}
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "multipath without wwid should fail");
+}
+
+#[test]
+fn validate_multipath_unique_wwid() {
+    let input = r#"
+multipath mp0 {
+    wwid = "3600508b1001c5a7380000300000e0000"
+    path /dev/sda {}
+}
+
+multipath mp1 {
+    wwid = "3600508b1001c5a7380000300000e0000"
+    path /dev/sdb {}
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "duplicate wwid should fail");
+}
+
+// ─── iSCSI ──────────────────────────────────────────────────
+
+#[test]
+fn parse_iscsi_basic() {
+    let input = r#"
+iscsi remote_storage {
+    target = iqn.2024.com.example:storage
+    portal = 192.168.1.100
+    auth = chap
+    username = "iscsi_user"
+
+    ext4 iscsi_data {
+        mount = /mnt/iscsi [nodev, nosuid]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 1);
+
+    if let StorageDecl::Iscsi(iscsi) = &ast.declarations[0] {
+        assert_eq!(iscsi.name, "remote_storage");
+        assert_eq!(iscsi.children.len(), 1);
+    } else {
+        panic!("expected iscsi");
+    }
+}
+
+#[test]
+fn validate_iscsi_requires_target_and_portal() {
+    let input = r#"
+iscsi bad_iscsi {
+    auth = chap
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "iscsi without target/portal should fail");
+}
+
+// ─── NFS ────────────────────────────────────────────────────
+
+#[test]
+fn parse_nfs_basic() {
+    let input = r#"
+nfs shared {
+    server = nfs-server.example.com
+    export = /exports/data
+    version = 4.2
+
+    mount {
+        target = /mnt/nfs
+        options = [nodev, nosuid, noexec]
+        requires = [network-online.target]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 1);
+
+    if let StorageDecl::Nfs(nfs) = &ast.declarations[0] {
+        assert_eq!(nfs.name, "shared");
+        assert!(nfs.mount_block.is_some());
+        let mb = nfs.mount_block.as_ref().unwrap();
+        assert_eq!(mb.target.as_deref(), Some("/mnt/nfs"));
+        assert_eq!(mb.requires.len(), 1);
+    } else {
+        panic!("expected nfs");
+    }
+}
+
+#[test]
+fn validate_nfs_requires_server_and_export() {
+    let input = r#"
+nfs bad_nfs {
+    version = 4.2
+
+    mount {
+        target = /mnt/nfs
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "nfs without server/export should fail");
+}
+
+// ─── tmpfs ──────────────────────────────────────────────────
+
+#[test]
+fn parse_tmpfs_basic() {
+    let input = r#"
+tmpfs runtime {
+    size = 2G
+    mode = 1777
+
+    mount {
+        target = /tmp
+        options = [nodev, nosuid, noexec]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 1);
+
+    if let StorageDecl::Tmpfs(t) = &ast.declarations[0] {
+        assert_eq!(t.name, "runtime");
+        assert!(t.mount_block.is_some());
+    } else {
+        panic!("expected tmpfs");
+    }
+}
+
+#[test]
+fn validate_tmpfs_requires_mount() {
+    let input = r#"
+tmpfs bad {
+    size = 1G
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "tmpfs without mount should fail");
+}
+
+// ─── Integrity ──────────────────────────────────────────────
+
+#[test]
+fn parse_integrity_block() {
+    let input = r#"
+disk /dev/sda {
+    label = gpt
+
+    integrity secured {
+        index = 1
+        size = 500G
+        algorithm = crc32c
+
+        ext4 verified_data {
+            mount = /srv/secure [nodev, nosuid]
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    if let StorageDecl::Disk(d) = &ast.declarations[0] {
+        assert_eq!(d.children.len(), 1);
+        if let PartitionChild::Integrity(i) = &d.children[0] {
+            assert_eq!(i.name, "secured");
+            assert_eq!(i.children.len(), 1);
+        } else {
+            panic!("expected integrity block");
+        }
+    }
+}
+
+// ─── VDO ────────────────────────────────────────────────────
+
+#[test]
+fn parse_vdo_in_lvm() {
+    let input = r#"
+disk /dev/sda {
+    label = gpt
+
+    lvm vg0 {
+        index = 1
+        size = remaining
+
+        vdo dedup_pool {
+            size = 100G
+            virtual_size = 1T
+            deduplication = true
+            compression = true
+
+            xfs dedup_data {
+                mount = /srv/dedup
+            }
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    if let StorageDecl::Disk(d) = &ast.declarations[0] {
+        if let PartitionChild::Lvm(lvm) = &d.children[0] {
+            assert_eq!(lvm.children.len(), 1);
+            if let LvmChild::Vdo(v) = &lvm.children[0] {
+                assert_eq!(v.name, "dedup_pool");
+                assert_eq!(v.children.len(), 1);
+            } else {
+                panic!("expected vdo");
+            }
+        } else {
+            panic!("expected lvm");
+        }
+    }
+}
+
+#[test]
+fn validate_vdo_requires_size_and_virtual_size() {
+    let input = r#"
+disk /dev/sda {
+    label = gpt
+
+    lvm vg0 {
+        index = 1
+        size = remaining
+
+        vdo bad_vdo {
+            deduplication = true
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "vdo without size/virtual_size should fail");
+}
+
+#[test]
+fn validate_vdo_virtual_size_gte_size() {
+    let input = r#"
+disk /dev/sda {
+    label = gpt
+
+    lvm vg0 {
+        index = 1
+        size = remaining
+
+        vdo bad_vdo {
+            size = 100G
+            virtual_size = 50G
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "vdo virtual_size < size should fail");
+}
+
+// ─── SELinux System Block ───────────────────────────────────
+
+#[test]
+fn parse_selinux_block() {
+    let input = r#"
+selinux {
+    mode = enforcing
+    policy = targeted
+    floor = standard
+
+    user system_u {
+        roles = [system_r, unconfined_r]
+        level = s0-s0:c0.c1023
+    }
+
+    user staff_u {
+        roles = [staff_r, sysadm_r]
+        level = s0-s0:c0.c1023
+        default = true
+    }
+
+    role sysadm_r {
+        types = [sysadm_t]
+        level = s0-s0:c0.c1023
+    }
+
+    booleans {
+        httpd_can_network_connect = true
+        container_manage_cgroup = true
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert!(ast.selinux.is_some());
+    let se = ast.selinux.as_ref().unwrap();
+    assert_eq!(se.users.len(), 2);
+    assert_eq!(se.users[0].name, "system_u");
+    assert_eq!(se.users[1].name, "staff_u");
+    assert_eq!(se.roles.len(), 1);
+    assert_eq!(se.roles[0].name, "sysadm_r");
+    assert!(!se.booleans.is_empty());
+}
+
+#[test]
+fn validate_selinux_invalid_mode() {
+    let input = r#"
+selinux {
+    mode = invalid_mode
+    policy = targeted
+
+    user system_u {
+        roles = [system_r]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "invalid selinux mode should fail");
+}
+
+#[test]
+fn validate_selinux_requires_system_u() {
+    let input = r#"
+selinux {
+    mode = enforcing
+    policy = targeted
+
+    user staff_u {
+        roles = [staff_r]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "selinux without system_u should fail");
+}
+
+#[test]
+fn validate_selinux_at_most_one_default_user() {
+    let input = r#"
+selinux {
+    mode = enforcing
+    policy = targeted
+
+    user system_u {
+        roles = [system_r]
+        default = true
+    }
+
+    user staff_u {
+        roles = [staff_r]
+        default = true
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "multiple default users should fail");
+}
+
+#[test]
+fn validate_selinux_user_requires_roles() {
+    let input = r#"
+selinux {
+    mode = enforcing
+    policy = targeted
+
+    user system_u {
+        level = s0
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    let result = validate(&ast);
+    assert!(result.is_err(), "selinux user without roles should fail");
+}
+
+// ─── Combined Scenario ──────────────────────────────────────
+
+#[test]
+fn parse_mixed_declarations() {
+    let input = r#"
+disk /dev/sda {
+    label = gpt
+
+    fat32 efi {
+        index = 1
+        size = 1G
+        mount = /boot/efi
+    }
+}
+
+nfs home_share {
+    server = fileserver.local
+    export = /exports/home
+    version = 4.2
+
+    mount {
+        target = /home
+        options = [nodev, nosuid]
+    }
+}
+
+tmpfs tmp_area {
+    size = 4G
+
+    mount {
+        target = /tmp
+        options = [nodev, nosuid, noexec]
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    assert_eq!(ast.declarations.len(), 3);
+    assert!(matches!(&ast.declarations[0], StorageDecl::Disk(_)));
+    assert!(matches!(&ast.declarations[1], StorageDecl::Nfs(_)));
+    assert!(matches!(&ast.declarations[2], StorageDecl::Tmpfs(_)));
+
+    let warnings = validate(&ast).expect("should validate");
+    let _ = warnings;
+}
+
+#[test]
+fn parse_zvol_with_luks() {
+    let input = r#"
+zpool secure_pool {
+    vdev v0 {
+        type = mirror
+        members = [/dev/sda, /dev/sdb]
+    }
+
+    zvol encrypted_vol {
+        size = 50G
+
+        luks2 zvol_crypt {
+            cipher = aes-xts-plain64
+
+            ext4 secure_data {
+                mount = /srv/secure
+            }
+        }
+    }
+}
+"#;
+    let ast = parse_storage(input).expect("should parse");
+    if let StorageDecl::Zpool(zp) = &ast.declarations[0] {
+        assert_eq!(zp.zvols.len(), 1);
+        assert_eq!(zp.zvols[0].children.len(), 1);
+        if let ZvolChild::Luks(l) = &zp.zvols[0].children[0] {
+            assert_eq!(l.name, "zvol_crypt");
+        } else {
+            panic!("expected luks inside zvol");
+        }
+    }
+}

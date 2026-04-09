@@ -7,6 +7,7 @@ pub use ironclad_diagnostics::Span;
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageFile {
     pub declarations: Vec<StorageDecl>,
+    pub selinux: Option<SelinuxBlock>,
 }
 
 /// Top-level storage declaration
@@ -14,6 +15,12 @@ pub struct StorageFile {
 pub enum StorageDecl {
     Disk(DiskBlock),
     MdRaid(MdRaidBlock),
+    Zpool(ZpoolBlock),
+    Stratis(StratisBlock),
+    Multipath(MultipathBlock),
+    Iscsi(IscsiBlock),
+    Nfs(NfsBlock),
+    Tmpfs(TmpfsBlock),
 }
 
 // ─── Disk ────────────────────────────────────────────────────
@@ -30,6 +37,7 @@ pub struct DiskBlock {
 pub enum PartitionChild {
     Filesystem(FsBlock),
     Luks(LuksBlock),
+    Integrity(IntegrityBlock),
     Lvm(LvmBlock),
     Raw(RawBlock),
     Swap(SwapBlock),
@@ -42,6 +50,114 @@ pub struct MdRaidBlock {
     pub name: String,
     pub properties: Vec<Property>,
     pub children: Vec<PartitionChild>,
+    pub span: Span,
+}
+
+// ─── ZFS Pool ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ZpoolBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub vdevs: Vec<VdevBlock>,
+    pub datasets: Vec<DatasetBlock>,
+    pub zvols: Vec<ZvolBlock>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VdevBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub children: Vec<DatasetBlock>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ZvolBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub children: Vec<ZvolChild>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum ZvolChild {
+    Swap(SwapBlock),
+    Filesystem(FsBlock),
+    Luks(LuksBlock),
+}
+
+// ─── Stratis ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StratisBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub filesystems: Vec<StratisFilesystem>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StratisFilesystem {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub mount_block: Option<MountBlockExt>,
+    pub span: Span,
+}
+
+// ─── Multipath ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MultipathBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub paths: Vec<PathBlock>,
+    pub children: Vec<PartitionChild>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathBlock {
+    pub device: String,
+    pub properties: Vec<Property>,
+    pub span: Span,
+}
+
+// ─── iSCSI ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IscsiBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub children: Vec<PartitionChild>,
+    pub span: Span,
+}
+
+// ─── NFS ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NfsBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub mount_block: Option<MountBlockExt>,
+    pub span: Span,
+}
+
+// ─── tmpfs ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmpfsBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub mount_block: Option<MountBlockExt>,
     pub span: Span,
 }
 
@@ -127,6 +243,23 @@ pub enum LuksChild {
     Swap(SwapBlock),
 }
 
+// ─── Integrity ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IntegrityBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub children: Vec<IntegrityChild>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum IntegrityChild {
+    Filesystem(FsBlock),
+    Lvm(LvmBlock),
+    Swap(SwapBlock),
+}
+
 // ─── LVM ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +275,7 @@ pub enum LvmChild {
     Filesystem(FsBlock),
     Swap(SwapBlock),
     Thin(ThinBlock),
+    Vdo(VdoBlock),
 }
 
 // ─── Thin Pool ───────────────────────────────────────────────
@@ -156,6 +290,22 @@ pub struct ThinBlock {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum ThinChild {
+    Filesystem(FsBlock),
+    Swap(SwapBlock),
+}
+
+// ─── VDO ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VdoBlock {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub children: Vec<VdoChild>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum VdoChild {
     Filesystem(FsBlock),
     Swap(SwapBlock),
 }
@@ -225,6 +375,31 @@ pub struct MlsRange {
 #[derive(Debug, Clone, Serialize)]
 pub struct Sensitivity {
     pub level: u32,
+}
+
+// ─── SELinux System Block ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelinuxBlock {
+    pub properties: Vec<Property>,
+    pub users: Vec<SelinuxUserDecl>,
+    pub roles: Vec<SelinuxRoleDecl>,
+    pub booleans: Vec<Property>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelinuxUserDecl {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelinuxRoleDecl {
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub span: Span,
 }
 
 // ─── Properties ──────────────────────────────────────────────
