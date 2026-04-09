@@ -1,0 +1,286 @@
+// Ironclad Storage Syntax — PEG Grammar (pest)
+// Phase 1: Full storage declaration parsing
+
+// ─── Top Level ───────────────────────────────────────────────
+
+file = { SOI ~ NEWLINE* ~ (storage_decl ~ NEWLINE*)* ~ EOI }
+
+storage_decl = { disk_block | mdraid_block }
+
+// ─── Disk Block ──────────────────────────────────────────────
+
+disk_block = {
+    "disk" ~ device_path ~ "{" ~ disk_body ~ "}"
+}
+
+disk_body = {
+    (property | partition_child)*
+}
+
+partition_child = {
+    fs_block | luks_block | lvm_block | raw_block | swap_block
+}
+
+// ─── mdraid Block ────────────────────────────────────────────
+
+mdraid_block = {
+    "mdraid" ~ ident ~ "{" ~ mdraid_body ~ "}"
+}
+
+mdraid_body = {
+    (property | mdraid_child)*
+}
+
+mdraid_child = {
+    fs_block | luks_block | lvm_block | raw_block | swap_block
+}
+
+// ─── LUKS Blocks ─────────────────────────────────────────────
+
+luks_block = {
+    luks_keyword ~ ident ~ "{" ~ luks_body ~ "}"
+}
+
+luks_keyword = { "luks2" | "luks1" }
+
+luks_body = {
+    (property | luks_child)*
+}
+
+luks_child = {
+    fs_block | lvm_block | swap_block
+}
+
+// ─── LVM Block ───────────────────────────────────────────────
+
+lvm_block = {
+    "lvm" ~ ident ~ "{" ~ lvm_body ~ "}"
+}
+
+lvm_body = {
+    (property | lvm_child)*
+}
+
+lvm_child = {
+    fs_block | swap_block | thin_block
+}
+
+// ─── Thin Pool Block ─────────────────────────────────────────
+
+thin_block = {
+    "thin" ~ ident ~ "{" ~ thin_body ~ "}"
+}
+
+thin_body = {
+    (property | thin_child)*
+}
+
+thin_child = {
+    fs_block | swap_block
+}
+
+// ─── Filesystem Blocks ───────────────────────────────────────
+
+fs_block = {
+    fs_keyword ~ ident ~ "{" ~ fs_body ~ "}"
+}
+
+fs_keyword = { "btrfs" | "ext4" | "xfs" | "fat32" | "ntfs" }
+
+fs_body = {
+    (property | subvol_block | mount_block_ext)*
+}
+
+// ─── Subvolume Block (btrfs only) ────────────────────────────
+
+subvol_block = {
+    "subvol" ~ subvol_name ~ "{" ~ subvol_body ~ "}"
+}
+
+subvol_name = @{ ("@" | ASCII_ALPHA) ~ (ASCII_ALPHANUMERIC | "_" | "-" | "@")* }
+
+subvol_body = {
+    (property | mount_block_ext)*
+}
+
+// ─── Swap Block ──────────────────────────────────────────────
+
+swap_block = {
+    "swap" ~ ident ~ "{" ~ swap_body ~ "}"
+}
+
+swap_body = {
+    property*
+}
+
+// ─── Raw Block ───────────────────────────────────────────────
+
+raw_block = {
+    "raw" ~ ident ~ "{" ~ raw_body ~ "}"
+}
+
+raw_body = {
+    property*
+}
+
+// ─── Mount Block (Extended Form) ─────────────────────────────
+
+mount_block_ext = {
+    "mount" ~ "{" ~ mount_property* ~ "}"
+}
+
+mount_property = {
+    mount_target_prop
+    | mount_options_prop
+    | mount_automount_prop
+    | mount_timeout_prop
+    | mount_requires_prop
+    | mount_before_prop
+    | mount_context_prop
+    | mount_fscontext_prop
+    | mount_defcontext_prop
+    | mount_rootcontext_prop
+}
+
+mount_target_prop     = { "target" ~ "=" ~ path_value }
+mount_options_prop    = { "options" ~ "=" ~ array_value }
+mount_automount_prop  = { "automount" ~ "=" ~ boolean }
+mount_timeout_prop    = { "timeout" ~ "=" ~ integer }
+mount_requires_prop   = { "requires" ~ "=" ~ array_value }
+mount_before_prop     = { "before" ~ "=" ~ array_value }
+mount_context_prop    = { "context" ~ "=" ~ selinux_context }
+mount_fscontext_prop  = { "fscontext" ~ "=" ~ selinux_context }
+mount_defcontext_prop = { "defcontext" ~ "=" ~ selinux_context }
+mount_rootcontext_prop = { "rootcontext" ~ "=" ~ selinux_context }
+
+// ─── Properties (key = value with ; separator) ───────────────
+
+property = {
+    ident ~ "=" ~ value ~ ";"?
+}
+
+// ─── Values ──────────────────────────────────────────────────
+
+value = {
+    mount_expr
+    | array_value
+    | size_value
+    | percentage
+    | remaining_kw
+    | boolean
+    | string_literal
+    | device_path
+    | url_string
+    | ident_value
+    | integer
+}
+
+// ─── Mount Expression (inline form) ─────────────────────────
+
+mount_expr = {
+    path_value ~ mount_options_bracket? ~ mount_inline_context?
+}
+
+mount_options_bracket = {
+    "[" ~ mount_option ~ ("," ~ mount_option)* ~ "]"
+}
+
+mount_option = @{
+    (ASCII_ALPHANUMERIC | "-" | "_" | "." | ":" | "=")+
+}
+
+mount_inline_context = {
+    "context" ~ selinux_context
+}
+
+// ─── SELinux Context ─────────────────────────────────────────
+
+selinux_context = @{
+    selinux_field ~ ":" ~ selinux_field ~ ":" ~ selinux_field ~ ":" ~ mls_range
+}
+
+selinux_field = @{
+    (ASCII_ALPHANUMERIC | "_")+
+}
+
+mls_range = @{
+    sensitivity ~ ("-" ~ sensitivity)? ~ (":" ~ category_set)?
+}
+
+sensitivity = @{
+    "s" ~ ASCII_DIGIT+
+}
+
+category_set = @{
+    category_expr ~ ("," ~ category_expr)*
+}
+
+category_expr = @{
+    "c" ~ ASCII_DIGIT+ ~ ("." ~ "c" ~ ASCII_DIGIT+)?
+}
+
+// ─── Size Values ─────────────────────────────────────────────
+
+size_value = @{
+    ASCII_DIGIT+ ~ size_unit
+}
+
+size_unit = @{
+    "TB" | "GB" | "MB" | "KB" | "T" | "G" | "M" | "K" | "B"
+}
+
+percentage = @{
+    ASCII_DIGIT+ ~ "%"
+}
+
+remaining_kw = { "remaining" }
+
+// ─── Primitives ──────────────────────────────────────────────
+
+integer = @{
+    "-"? ~ ASCII_DIGIT+
+}
+
+boolean = { "true" | "false" }
+
+string_literal = @{
+    "\"" ~ (!"\"" ~ ANY)* ~ "\""
+}
+
+url_string = @{
+    "http" ~ "s"? ~ "://" ~ (ASCII_ALPHANUMERIC | "." | "-" | "/" | ":" | "_" | "?" | "&" | "=" | "%" | "#")+
+}
+
+array_value = {
+    "[" ~ array_item ~ ("," ~ array_item)* ~ "]"
+}
+
+array_item = {
+    size_value
+    | string_literal
+    | device_path
+    | boolean
+    | ident_value
+    | integer
+}
+
+ident_value = @{
+    (ASCII_ALPHANUMERIC | "_" | "-" | "." | ":")+
+}
+
+device_path = @{
+    "/" ~ (ASCII_ALPHANUMERIC | "/" | "_" | "-" | ".")+
+}
+
+path_value = @{
+    "/" ~ (ASCII_ALPHANUMERIC | "/" | "_" | "-" | ".")*
+}
+
+ident = @{
+    (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")*
+}
+
+// ─── Whitespace & Comments ───────────────────────────────────
+
+WHITESPACE = _{ " " | "\t" | NEWLINE }
+COMMENT = _{ "#" ~ (!NEWLINE ~ ANY)* }
