@@ -1,14 +1,7 @@
 use serde::Serialize;
 use std::fmt;
 
-/// Source location for diagnostic reporting
-#[derive(Debug, Clone, Serialize)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-    pub line: usize,
-    pub col: usize,
-}
+pub use ironclad_diagnostics::Span;
 
 /// Root of the storage AST — a collection of top-level declarations
 #[derive(Debug, Clone, Serialize)]
