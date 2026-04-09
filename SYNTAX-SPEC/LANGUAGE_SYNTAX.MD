@@ -21,7 +21,7 @@ The key design constraints:
 
 5. **The scope hierarchy is: system > storage topology > filesystem tree > file properties.** Variables, classes, and functions can be declared at any scope and are visible to that scope and its children.
 
----
+---    
 
 ## Variables
 
