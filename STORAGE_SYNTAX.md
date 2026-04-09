@@ -1,7 +1,7 @@
 # Ironclad Storage Syntax Specification
 
 **Status:** Draft — syntax development, Phase 1  
-**Scope:** Disk, partitioning, encryption, volume management, filesystems, mounts, and storage-level SELinux labeling
+**Scope:** Disk, partitioning, encryption, integrity, volume management (LVM, ZFS, Stratis), RAID (mdraid), deduplication/compression (VDO), multipath, network storage (iSCSI, NFS), virtual filesystems (tmpfs), filesystems, mounts, and storage-level SELinux labeling
 
 ---
 
@@ -84,6 +84,320 @@ mdraid md0 {
 **Children:** Same as `disk` — filesystem blocks, `luks2`, `lvm`, or `raw`.
 
 **Compiler behavior:** Emits `mdadm --create /dev/md/<n>` with the specified parameters. Member devices must either be raw partitions declared elsewhere in the source tree (compiler validates their existence) or assumed-present paths for pre-existing hardware.
+
+---
+
+### `zpool`
+
+Declares a ZFS storage pool. ZFS is a combined volume manager and filesystem — zpools contain vdevs (virtual devices) that provide redundancy, and datasets or zvols that consume pool capacity. Unlike the LVM/mdraid/filesystem separation elsewhere in the storage syntax, ZFS collapses these layers into a single hierarchy.
+
+```
+zpool tank {
+    vdev data-raidz1 {
+        type = raidz1
+        members = [/dev/sda, /dev/sdb, /dev/sdc]
+    }
+    
+    vdev log-mirror {
+        type = mirror
+        members = [/dev/nvme0n1p1, /dev/nvme1n1p1]
+    }
+    
+    vdev cache0 {
+        type = cache
+        members = [/dev/nvme2n1]
+    }
+    
+    dataset root {
+        mountpoint = /tank
+        compression = zstd
+        atime = false
+    }
+    
+    dataset containers {
+        mountpoint = /var/lib/containers
+        compression = zstd
+        quota = 500G
+        reservation = 100G
+    }
+    
+    zvol swap {
+        size = 16G
+    }
+}
+```
+
+**Optional pool-level properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `ashift` | integer | auto-detected | Sector size exponent (`zpool create -o ashift=`). `12` for 4K drives, `9` for 512-byte. Auto-detection is correct on modern hardware; override only when you know the drive lies about sector size. |
+| `autoexpand` | `true` \| `false` | `false` | Automatically expand pool when underlying devices grow. |
+| `autotrim` | `true` \| `false` | `false` | Automatic TRIM/discard on SSDs. |
+| `multihost` | `true` \| `false` | `false` | Multi-host protection (`zpool create -o multihost=on`). |
+| `altroot` | path | none | Alternate root directory for pool import. |
+
+**Children:** `vdev`, `dataset`, and `zvol` blocks.
+
+**Compiler behavior:** Emits `zpool create <name>` with assembled vdev specifications. The compiler topologically sorts vdev types: data vdevs first, then log, then cache, then spare — matching ZFS's argument ordering. Requires the `zfs` package in the image package list.
+
+---
+
+#### `vdev`
+
+A virtual device within a zpool. The `type` property determines the redundancy strategy.
+
+```
+vdev main {
+    type = raidz2
+    members = [/dev/sda, /dev/sdb, /dev/sdc, /dev/sdd, /dev/sde, /dev/sdf]
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `type` | `mirror` \| `raidz1` \| `raidz2` \| `raidz3` \| `stripe` \| `spare` \| `log` \| `cache` | Vdev topology type. `stripe` is the default ZFS behavior (no keyword emitted). `log` and `cache` are special-purpose vdevs — `log` provides a ZFS Intent Log (ZIL) for synchronous writes; `cache` provides an L2ARC read cache. |
+| `members` | array of device paths | Member devices. |
+
+**Compiler behavior:** For `mirror`, `raidz1`, `raidz2`, `raidz3`: emits the keyword followed by member devices in the `zpool create` argument list. For `stripe`: emits member devices with no keyword (ZFS default). For `log` and `cache`: emits the keyword as a separator in the vdev list. For `spare`: emits the `spare` keyword. A `log` vdev with multiple members and `type = mirror` on the vdev name implies `log mirror <members>`.
+
+**Validation:**
+- `raidz1` requires a minimum of 3 members.
+- `raidz2` requires a minimum of 4 members.
+- `raidz3` requires a minimum of 5 members.
+- `mirror` requires a minimum of 2 members.
+- `cache` and `spare` vdevs should not use the same devices as data or log vdevs.
+- Member devices must not appear in more than one vdev within the same pool.
+
+---
+
+#### `dataset`
+
+A ZFS dataset (filesystem) within a zpool. Datasets are the primary unit of data organization in ZFS and inherit properties from their parent pool or dataset.
+
+```
+dataset home {
+    mountpoint = /home
+    compression = zstd
+    quota = 1T
+    reservation = 200G
+    atime = false
+    exec = false
+    setuid = false
+    devices = false
+}
+```
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mountpoint` | path \| `none` | `/<pool>/<dataset>` | Mount point (`zfs set mountpoint=`). `none` creates the dataset without mounting it. |
+| `compression` | `off` \| `lz4` \| `zstd` \| `zstd:<level>` \| `gzip` \| `gzip:<level>` \| `lzjb` \| `zle` | `off` | Compression algorithm (`zfs set compression=`). |
+| `quota` | size string | none | Maximum space this dataset can consume (`zfs set quota=`). |
+| `refquota` | size string | none | Maximum space for this dataset excluding snapshots and children (`zfs set refquota=`). |
+| `reservation` | size string | none | Guaranteed space allocation (`zfs set reservation=`). |
+| `refreservation` | size string | none | Guaranteed space excluding snapshots and children (`zfs set refreservation=`). |
+| `recordsize` | size string | `128K` | Maximum record size (`zfs set recordsize=`). Tune for workload: `16K` for databases, `1M` for sequential large files. |
+| `atime` | `true` \| `false` | `true` | Update access time on reads (`zfs set atime=`). |
+| `relatime` | `true` \| `false` | `false` | Only update atime when mtime/ctime changes (`zfs set relatime=`). |
+| `exec` | `true` \| `false` | `true` | Allow execution of binaries (`zfs set exec=`). |
+| `setuid` | `true` \| `false` | `true` | Allow setuid binaries (`zfs set setuid=`). |
+| `devices` | `true` \| `false` | `true` | Allow device nodes (`zfs set devices=`). |
+| `dedup` | `off` \| `on` \| `verify` \| `sha256` \| `sha512` \| `skein` | `off` | Deduplication (`zfs set dedup=`). Extreme RAM cost — approximately 5GB per TB of data. |
+| `copies` | `1` \| `2` \| `3` | `1` | Number of data copies (`zfs set copies=`). |
+| `snapdir` | `visible` \| `hidden` | `hidden` | Visibility of `.zfs/snapshot` directory. |
+| `xattr` | `on` \| `off` \| `sa` | `on` | Extended attribute handling. `sa` stores xattrs in system attributes (preferred on Linux for SELinux). |
+| `dnodesize` | `legacy` \| `auto` \| `1k` \| `2k` \| `4k` \| `8k` \| `16k` | `legacy` | Dnode size for metadata-heavy workloads. |
+| `encryption` | `off` \| `aes-256-gcm` \| `aes-256-ccm` | `off` | Native ZFS encryption. Encrypts data at the dataset level — different datasets can have different keys. |
+| `keyformat` | `passphrase` \| `hex` \| `raw` | `passphrase` | Encryption key format (when `encryption` is not `off`). |
+| `keylocation` | `prompt` \| URL \| path | `prompt` | Where to load the encryption key from. |
+| `context` | SELinux context expression | none | SELinux mount context. Applied via `-o context=` when mounting. |
+
+**Children:** Nested `dataset` blocks for hierarchical dataset organization.
+
+**Compiler behavior:** Emits `zfs create <pool>/<dataset>` with `-o` flags for each declared property. Nested datasets emit as `<pool>/<parent>/<child>`. When `encryption` is not `off`, emits `zfs create -o encryption=<alg> -o keyformat=<fmt> -o keylocation=<loc>`.
+
+**SELinux note:** ZFS with `xattr = sa` supports extended attributes and therefore supports per-file SELinux labeling. ZFS with `xattr = off` does not and requires `context=` mount semantics, same as `fat32`. The compiler enforces this distinction.
+
+---
+
+#### `zvol`
+
+A ZFS volume — a block device backed by a zpool. Used for swap, iSCSI targets, or scenarios requiring a raw block device with ZFS's data management underneath.
+
+```
+zvol swap {
+    size = 16G
+    compression = lz4
+    volblocksize = 4K
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `size` | size string | Volume size (`zfs create -V`). |
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `volblocksize` | size string | `8K` | Block size for the volume (`zfs create -b`). |
+| `compression` | same as `dataset` | `off` | Compression algorithm. |
+| `dedup` | same as `dataset` | `off` | Deduplication. |
+| `reservation` | size string | equals `size` | Space reservation. ZFS reserves the full volume size by default (thick provisioning). |
+| `sparse` | `true` \| `false` | `false` | Thin provisioning — do not reserve the full volume size. (`zfs create -s -V`). |
+
+**Children:** `swap` blocks, or treated as a raw block device for use by `luks2`, filesystem blocks, etc.
+
+**Compiler behavior:** Emits `zfs create -V <size> <pool>/<name>`. The resulting block device appears at `/dev/zvol/<pool>/<name>`.
+
+---
+
+### `stratis`
+
+Declares a Stratis managed storage pool. Stratis is Red Hat's strategic local storage management solution, providing a ZFS-like experience within the RHEL ecosystem — managed pools with thin-provisioned filesystems, snapshots, and optional encryption. Stratis pools always produce XFS filesystems.
+
+```
+stratis appdata {
+    disks = [/dev/sda, /dev/sdb]
+    encrypted = true
+    
+    filesystem web {
+        mountpoint = /srv/www
+        size_limit = 200G
+    }
+    
+    filesystem database {
+        mountpoint = /var/lib/postgres
+        size_limit = 500G
+    }
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `disks` | array of device paths | Block devices forming the pool's data tier. |
+
+**Optional pool-level properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `encrypted` | `true` \| `false` | `false` | Encrypt the pool at the block layer (`stratis pool create --key-desc`). Uses kernel keyring for key management. |
+| `key_desc` | string | pool name | Kernel keyring key description for encryption. |
+| `cache` | array of device paths | none | Block devices for the pool's cache tier (`stratis pool init-cache`). Typically SSDs. |
+| `cache_mode` | `writeback` \| `writethrough` | `writethrough` | Cache write policy. `writeback` improves performance but risks data loss on cache failure. |
+| `overprovision` | `true` \| `false` | `true` | Allow thin-provisioned filesystems to overcommit pool capacity. |
+
+**Children:** `filesystem` blocks.
+
+**Compiler behavior:** Emits `stratis pool create <name> <disks>`. If `encrypted = true`, emits key setup via `stratis key set` before pool creation. If `cache` is specified, emits `stratis pool init-cache <name> <cache_disks>` after pool creation. Requires the `stratisd` and `stratis-cli` packages in the image.
+
+---
+
+#### `filesystem` (Stratis)
+
+A thin-provisioned XFS filesystem within a Stratis pool. Stratis filesystems are always XFS — the filesystem type is not configurable.
+
+```
+filesystem containers {
+    mountpoint = /var/lib/containers
+    size_limit = 1T
+}
+```
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mountpoint` | path | none | Mount point. |
+| `size_limit` | size string | none | Filesystem size limit. Stratis filesystems are thin-provisioned and grow on demand; `size_limit` caps the maximum. Without a limit, the filesystem can consume the entire pool. |
+| `options` | array of strings | `[defaults]` | Additional mount options. |
+| `context` | SELinux context expression | none | SELinux mount context. |
+
+**Compiler behavior:** Emits `stratis filesystem create <pool> <name>`. If `size_limit` is set, emits `stratis filesystem create --size-limit <limit>`. Mount entries use the Stratis device path `/dev/stratis/<pool>/<filesystem>`. Fstab entries use `x-systemd.requires=stratisd.service` to ensure the Stratis daemon is running before mount.
+
+**SELinux note:** Stratis filesystems are XFS and support extended attributes. Per-file SELinux labeling works normally. Mount-level context is optional.
+
+---
+
+### `multipath`
+
+Declares a device-mapper multipath device for SAN-attached storage with redundant paths. Multipath is a top-level block that presents multiple physical paths to the same LUN as a single virtual device.
+
+```
+multipath mpath0 {
+    wwid = "3600508b4000c4a37000009000012a000"
+    policy = round-robin
+    
+    path /dev/sda {
+        priority_group = 1
+    }
+    
+    path /dev/sdb {
+        priority_group = 1
+    }
+    
+    path /dev/sdc {
+        priority_group = 2
+    }
+    
+    path /dev/sdd {
+        priority_group = 2
+    }
+    
+    luks2 encrypted_san {
+        lvm vg_san {
+            xfs data { size = remaining; mount = /srv/san }
+        }
+    }
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `wwid` | string | World Wide Identifier of the LUN. Used to correlate paths. |
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `policy` | `round-robin` \| `queue-length` \| `service-time` | `service-time` | Path selection policy (`multipathd` path selector). |
+| `failback` | `immediate` \| `manual` \| integer (seconds) | `immediate` | Failback behavior when a failed path recovers. |
+| `no_path_retry` | `fail` \| `queue` \| integer | `fail` | Behavior when all paths fail. `queue` holds I/O until a path returns; integer specifies retry count before failing. |
+| `rr_min_io` | integer | `1000` | Minimum I/O requests per path before switching in round-robin. |
+| `checker` | `tur` \| `readsector0` \| `directio` | `tur` | Path health checker. `tur` (Test Unit Ready) is preferred for most hardware. |
+| `features` | array of strings | none | DM multipath features (e.g., `[queue_if_no_path, retain_attached_hw_handler]`). |
+
+**Children:** `path` blocks declaring individual paths, followed by the same children as `disk` — filesystem blocks, `luks2`, `lvm`, or `raw`.
+
+**Compiler behavior:** Generates `/etc/multipath.conf` entries for the device and emits `multipath -r` to reconfigure. The multipath device appears at `/dev/mapper/<name>`. Requires `device-mapper-multipath` in the image package list.
+
+---
+
+#### `path`
+
+An individual physical path within a `multipath` block.
+
+```
+path /dev/sda {
+    priority_group = 1
+}
+```
+
+**Properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `priority_group` | integer | `1` | Priority group number. Lower groups are preferred. All paths in the same group are active simultaneously under the parent's path selection policy; higher-numbered groups are standby. |
 
 ---
 
@@ -322,6 +636,47 @@ ntfs shared {
 
 ---
 
+### `tmpfs`
+
+Declares a tmpfs mount — a RAM-backed filesystem. Not a block device, but a declared mount with properties that the compiler must track for fstab generation, SELinux labeling, and security floor enforcement. Nearly every hardened system explicitly declares `/tmp`, `/run`, `/dev/shm`, and `/var/tmp` as tmpfs.
+
+```
+tmpfs tmp {
+    mount = /tmp [nodev, nosuid, noexec] context system_u:object_r:tmp_t:s0
+    size = 2G
+}
+
+tmpfs devshm {
+    mount = /dev/shm [nodev, nosuid, noexec]
+    size = 50%
+}
+
+tmpfs run {
+    mount = /run [nodev, nosuid] context system_u:object_r:var_run_t:s0
+}
+```
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `size` | size string \| percentage | `50%` | Maximum size. Percentage is relative to total system RAM. `50%` is the kernel default. |
+| `nr_inodes` | integer \| `unlimited` | kernel default | Maximum number of inodes. |
+| `nr_blocks` | integer | derived from `size` | Maximum number of blocks. Rarely specified directly — use `size` instead. |
+| `mode` | octal string | `1777` for `/tmp`, `0755` for others | Root directory permissions. |
+| `uid` | integer \| string | `0` | Owner UID or username. |
+| `gid` | integer \| string | `0` | Owner GID or group name. |
+| `huge` | `never` \| `always` \| `within_size` \| `advise` | `never` | Huge page allocation policy (`mount -o huge=`). |
+| `mount` | mount expression | required | Mount target and options. |
+
+**Compiler behavior:** Emits an fstab entry with `tmpfs` as the filesystem type and `tmpfs` as the device. Mount options include `size=`, `nr_inodes=`, `mode=`, and SELinux context options as specified. No `mkfs` is emitted — tmpfs requires no formatting.
+
+**SELinux note:** `tmpfs` does not support xattr-based labeling. All labeling must be done via mount-level `context=`. The compiler enforces this under MLS: a `tmpfs` block without a `context` declaration when the security floor is `strict` or higher is an error.
+
+**Security floor interaction:** Under `standard` and above, `/tmp` must have `nodev, nosuid, noexec`. Under `strict` and above, `/dev/shm` must have `nodev, nosuid, noexec`. These are enforced on `tmpfs` blocks whose `mount` target matches these paths.
+
+---
+
 ## Encryption Blocks
 
 ### `luks2`
@@ -379,6 +734,47 @@ luks1 legacy_boot {
 ```
 
 **Compiler behavior:** Emits `cryptsetup luksFormat --type luks1`.
+
+---
+
+### `integrity`
+
+Declares a dm-integrity block device providing sector-level data integrity verification. dm-integrity stores checksums alongside data, detecting silent corruption (bitrot) at the block layer before it propagates to filesystems.
+
+dm-integrity can operate standalone (data integrity only) or paired with LUKS2 (authenticated encryption — confidentiality plus integrity). When declared inside a `luks2` block, the `integrity` property on the LUKS block itself is the preferred syntax (see `luks2` above). The standalone `integrity` block is for scenarios where integrity verification is desired without encryption.
+
+```
+integrity verified_data {
+    algorithm = crc32c
+    
+    xfs data {
+        size = remaining
+        mount = /srv/verified [nodev, nosuid, noexec]
+    }
+}
+```
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `algorithm` | `crc32c` \| `crc32` \| `sha1` \| `sha256` \| `hmac-sha256` \| `hmac-sha512` | `crc32c` | Integrity hash algorithm. `crc32c` is fastest with hardware acceleration on modern x86. `sha256` and above provide cryptographic integrity but at significant I/O cost. `hmac-*` variants require a key and provide authentication — use these when tampering detection (not just corruption detection) is required. |
+| `tag_size` | integer | algorithm-dependent | Integrity tag size in bytes. Automatically sized for the chosen algorithm; override only for non-standard configurations. |
+| `sector_size` | integer | `512` | Protected sector size. `4096` reduces metadata overhead on 4Kn drives. |
+| `journal` | `true` \| `false` | `true` | Enable the dm-integrity write journal. The journal ensures atomicity of data+tag writes — without it, a crash can leave data and its tag inconsistent. Disabling improves write performance but risks false corruption reports after unclean shutdown. |
+| `journal_size` | size string | auto | Journal size. Larger journals absorb longer write bursts before stalling. |
+| `recalculate` | `true` \| `false` | `false` | Recalculate integrity tags on first activation. Required when adding integrity to a device with existing data. Runs in the background. |
+| `mode` | `journal` \| `bitmap` \| `direct` | `journal` | Write mode. `journal` provides full atomicity. `bitmap` tracks dirty sectors for faster recovery but without full atomicity. `direct` writes data and tags directly with no crash protection — fast but unsafe. |
+
+**Children:** Filesystem blocks, `lvm`, or `swap`.
+
+**Compiler behavior:** Emits `integritysetup format <device> --integrity <algorithm>` followed by `integritysetup open <device> <n>`. The opened device appears at `/dev/mapper/<n>`. Requires `integritysetup` (part of `cryptsetup` package).
+
+**Performance note:** dm-integrity adds measurable write latency due to tag computation and journaling. With `crc32c` and journaling, expect approximately 10-20% write throughput reduction. With `hmac-sha256` and journaling, expect 40-60% reduction. Read impact is smaller — tags are verified inline during reads. Profile your workload before deploying in performance-sensitive environments.
+
+**Validation:**
+- `hmac-*` algorithms require a key source. When used standalone (not inside LUKS2), the compiler requires a `key` property pointing to a keyfile or kernel keyring descriptor.
+- When nested inside `luks2`, the `integrity` property on the LUKS block is used instead of a separate `integrity` block. Declaring both is an error.
 
 ---
 
@@ -447,6 +843,166 @@ thin pool0 {
 **Children:** Filesystem blocks. These become thin logical volumes in the pool. Their `size` is virtual.
 
 **Compiler behavior:** Emits `lvcreate --thin --size <pool_size> <vg>/<pool_name>`, then `lvcreate --thin --virtualsize <lv_size> <vg>/<pool_name> --name <lv_name>` for each child.
+
+---
+
+#### `vdo`
+
+An LVM VDO (Virtual Data Optimizer) logical volume providing inline deduplication and compression at the block layer. Only valid inside an `lvm` block. On RHEL 9+, VDO is integrated directly into LVM as `lvm_vdo` — the standalone VDO module is deprecated.
+
+```
+lvm vg0 {
+    vdo dedup_pool {
+        size = 500G
+        virtual_size = 2T
+        deduplication = true
+        compression = true
+        
+        xfs data {
+            mount = /srv/data [nodev, nosuid, noexec]
+        }
+    }
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `size` | size string | Physical size of the VDO pool (actual disk space consumed). |
+| `virtual_size` | size string | Virtual size presented to the filesystem above. Can exceed physical size due to deduplication and compression. |
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `deduplication` | `true` \| `false` | `true` | Enable block-level deduplication. |
+| `compression` | `true` \| `false` | `true` | Enable block-level compression. |
+| `write_policy` | `auto` \| `sync` \| `async` | `auto` | Write policy. `auto` selects based on underlying storage. `sync` for data integrity on non-battery-backed storage; `async` for performance when write-back caching is safe. |
+| `slab_size` | size string | `2G` | VDO slab size. Each slab consumes approximately 824 bytes of VDO metadata. Larger slabs reduce metadata overhead for large pools. Valid: `128M` through `32G`, powers of 2. |
+| `block_map_cache_size` | size string | `128M` | Size of the block map cache in RAM. Larger values improve random read performance. |
+| `block_map_period` | integer | `16380` | Block map era length. Controls how often the block map is flushed to disk. |
+| `index_memory` | size string | `256M` | UDS index memory. Controls deduplication index size. `256M` handles approximately 1TB of unique data. Scale proportionally. |
+| `sparse_index` | `true` \| `false` | `false` | Use a sparse UDS index. Reduces RAM usage at the cost of deduplication effectiveness. |
+| `emulate_512` | `true` \| `false` | `false` | Emulate 512-byte sectors for legacy applications. |
+| `overcommit_warn` | percentage | `80%` | Warning when virtual allocation reaches this percentage of estimated deduplication-adjusted capacity. |
+
+**Children:** A single filesystem block or `swap` block.
+
+**Compiler behavior:** Emits `lvcreate --type vdo --name <n> --size <size> --virtualsize <virtual_size> <vg>`. Followed by VDO property configuration via `lvchange`. Requires LVM with VDO support (`lvm2` package on RHEL 9+).
+
+**Validation:**
+- `virtual_size` must be greater than or equal to `size`.
+- `slab_size` must be a power of 2 between `128M` and `32G`.
+- Physical size must be at least `5G` (VDO minimum for metadata and slabs).
+
+---
+
+---
+
+## Network Storage
+
+Network-attached storage is not a local block device, but it is declared storage with mount targets, credentials, failure behavior, and SELinux labeling that the system definition must capture. The compiler tracks network mounts for fstab generation, dependency ordering, and security floor enforcement.
+
+### `iscsi`
+
+Declares an iSCSI target connection. The resulting block device is treated as a local device and can contain the same children as `disk` — filesystems, LUKS, LVM, or raw.
+
+```
+iscsi san_lun0 {
+    target = "iqn.2024.com.example:storage.lun0"
+    portal = "10.0.1.50:3260"
+    auth = chap
+    username = "initiator01"
+    
+    luks2 encrypted_san {
+        lvm vg_san {
+            xfs data { size = remaining; mount = /srv/san [nodev, nosuid, noexec] }
+        }
+    }
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `target` | string | iSCSI Qualified Name (IQN) of the target. |
+| `portal` | string | Target portal address (`host:port`). Port defaults to 3260 if omitted. |
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `auth` | `none` \| `chap` \| `chap_mutual` | `none` | Authentication method. `chap` uses one-way CHAP; `chap_mutual` uses mutual CHAP where the target also authenticates to the initiator. |
+| `username` | string | none | CHAP username (required when `auth` is `chap` or `chap_mutual`). |
+| `initiator_name` | string | system default | Override the iSCSI initiator name (IQN) for this connection. |
+| `lun` | integer | `0` | Logical Unit Number to connect to on the target. |
+| `auto_login` | `true` \| `false` | `true` | Automatically log in to the target at boot. |
+| `replacement_timeout` | integer | `120` | Seconds to wait for session recovery before failing I/O. |
+| `startup` | `automatic` \| `onboot` \| `manual` | `automatic` | When to establish the iSCSI session. `onboot` connects before network filesystems; `automatic` connects after. |
+| `multipath` | `true` \| `false` | `false` | When `true`, the iSCSI device feeds into a `multipath` block rather than being used directly. |
+| `portals` | array of strings | none | Additional portal addresses for multipath or failover. |
+
+**Children:** Same as `disk` — filesystem blocks, `luks2`, `lvm`, `raw`.
+
+**Compiler behavior:** Configures `/etc/iscsi/iscsid.conf` for the session, emits `iscsiadm -m discovery -t sendtargets -p <portal>` and `iscsiadm -m node -T <target> -p <portal> --login` during provisioning. Generates fstab entries with `_netdev` and `x-systemd.requires=iscsi.service`. Requires `iscsi-initiator-utils` in the image package list.
+
+**Validation:**
+- `username` is required when `auth` is not `none`.
+- Credentials are references to the system's secret management declarations — the compiler does not accept plaintext passwords in storage syntax.
+
+---
+
+### `nfs`
+
+Declares an NFS mount. NFS mounts are not block devices and cannot contain children — they declare a remote filesystem mount with connection parameters.
+
+```
+nfs home_nfs {
+    server = "nfs.internal.example.com"
+    export = "/exports/home"
+    version = 4.2
+    
+    mount {
+        target = /home
+        options = [nodev, nosuid, sec=krb5p, hard, intr]
+        requires = [network-online.target, gssproxy.service]
+        context = system_u:object_r:home_root_t:s0
+    }
+}
+```
+
+**Required properties:**
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `server` | string | NFS server hostname or IP address. |
+| `export` | path | Server-side export path. |
+
+**Optional properties:**
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `version` | `3` \| `4` \| `4.1` \| `4.2` | `4.2` | NFS protocol version (`mount -o vers=`). |
+| `sec` | `sys` \| `krb5` \| `krb5i` \| `krb5p` | `sys` | Security flavor. `sys` uses AUTH_SYS (UID/GID). `krb5` uses Kerberos authentication. `krb5i` adds integrity checking. `krb5p` adds encryption. |
+| `proto` | `tcp` \| `udp` \| `rdma` | `tcp` | Transport protocol. |
+| `rsize` | size string | negotiated | Read buffer size. |
+| `wsize` | size string | negotiated | Write buffer size. |
+| `timeo` | integer | `600` | Timeout in tenths of a second for NFS requests. |
+| `retrans` | integer | `2` | Number of retransmissions before failing. |
+| `hard` | `true` \| `false` | `true` | Hard mount — retry indefinitely on server failure. `false` produces a soft mount that returns errors after `retrans` attempts. |
+| `mount` | mount expression or mount block | required | Mount target and options. |
+
+**Children:** None. NFS mounts declare a mount point only.
+
+**Compiler behavior:** Emits an fstab entry with `<server>:<export>` as the device, `nfs` or `nfs4` as the type, and assembled options. Adds `_netdev` automatically. If `sec` is any `krb5*` variant, adds `x-systemd.requires=gssproxy.service` (or `rpc-gssd.service` depending on distribution). Requires `nfs-utils` in the image package list.
+
+**SELinux note:** NFS supports SELinux labeling via two mechanisms: (1) `context=` mount option (blanket label, same as `fat32`), and (2) NFSv4.2 labeled NFS (`sec=krb5*` with server-side SELinux support), which transfers file labels from the server. The compiler validates `context=` usage as with other non-xattr filesystems. Labeled NFS is declared by omitting `context` and ensuring `version = 4.2`.
+
+**Validation:**
+- `sec = krb5*` variants require Kerberos infrastructure. The compiler emits a warning if no Kerberos keytab is declared in the system definition.
+- Soft mounts (`hard = false`) under `strict` security floor or above produce a warning — soft NFS mounts can cause silent data corruption when the server is unreachable.
 
 ---
 
@@ -667,10 +1223,13 @@ The compiler knows which filesystem types support SELinux xattr labeling and whi
 | `ext4` | yes | File contexts via `restorecon`; mount-level `defcontext`/`rootcontext` optional |
 | `xfs` | yes | Same as ext4 |
 | `btrfs` | yes | Same as ext4 |
+| `zfs dataset` | yes (with `xattr = sa` or `xattr = on`) | File contexts via `restorecon`; mount-level `defcontext`/`rootcontext` optional. Requires `xattr` not set to `off`. |
+| `stratis` | yes (XFS-backed) | Same as ext4 |
 | `fat32` | no | **Must** use `context=` for all labeling |
 | `ntfs` | no | **Must** use `context=` for all labeling |
 | `swap` | n/a | Labeled via policy, not mount context |
-| `tmpfs` (future) | no | **Must** use `context=` for all labeling |
+| `tmpfs` | no | **Must** use `context=` for all labeling |
+| `nfs` | conditional | NFSv4.2 with labeled NFS transfers labels from server; otherwise **must** use `context=` |
 
 When no xattr support exists and the SELinux mode is `mls`, the compiler enforces that `context` is declared. Without it, files under the mount inherit `unlabeled_t` which MLS policy denies access to — a guaranteed boot failure or data access failure.
 
@@ -944,6 +1503,240 @@ disk /dev/nvme0n1 {
 }
 ```
 
+### ZFS NAS with Mixed Vdevs
+
+```
+zpool storage {
+    ashift = 12
+    autotrim = true
+    
+    vdev data-raidz2 {
+        type = raidz2
+        members = [/dev/sda, /dev/sdb, /dev/sdc, /dev/sdd, /dev/sde, /dev/sdf]
+    }
+    
+    vdev slog {
+        type = mirror
+        members = [/dev/nvme0n1p1, /dev/nvme1n1p1]
+    }
+    
+    vdev l2arc {
+        type = cache
+        members = [/dev/nvme0n1p2]
+    }
+    
+    dataset media {
+        mountpoint = /srv/media
+        compression = zstd
+        recordsize = 1M
+        atime = false
+        exec = false
+        setuid = false
+        devices = false
+    }
+    
+    dataset containers {
+        mountpoint = /var/lib/containers
+        compression = zstd
+        recordsize = 128K
+        quota = 500G
+        
+        dataset volumes {
+            mountpoint = /var/lib/containers/storage/volumes
+            reservation = 100G
+        }
+    }
+    
+    dataset backups {
+        mountpoint = /srv/backups
+        compression = zstd:9
+        copies = 2
+        exec = false
+        setuid = false
+        devices = false
+    }
+    
+    zvol swap {
+        size = 16G
+        compression = lz4
+        volblocksize = 4K
+    }
+}
+```
+
+### Stratis Managed Application Storage
+
+```
+disk /dev/nvme0n1 {
+    label = gpt
+    
+    fat32 efi {
+        index = 1
+        size = 1G
+        type = ef00
+        mount = /boot/efi [nodev, nosuid, noexec]
+    }
+    
+    ext4 boot {
+        index = 2
+        size = 1G
+        mount = /boot [nodev, nosuid, noexec]
+    }
+    
+    luks2 system {
+        index = 3
+        size = 100G
+        tpm2 = true
+        
+        lvm vg0 {
+            btrfs root {
+                size = remaining
+                compress = zstd:1
+                
+                subvol @ { mount = / }
+                subvol @home { mount = /home [nodev, nosuid] }
+                subvol @var { mount = /var [nodev, nosuid, noexec] }
+            }
+            
+            swap swap0 { size = 16G }
+        }
+    }
+}
+
+stratis appdata {
+    disks = [/dev/sda, /dev/sdb]
+    encrypted = true
+    cache = [/dev/nvme0n1p4]
+    
+    filesystem web {
+        mountpoint = /srv/www
+        size_limit = 200G
+    }
+    
+    filesystem database {
+        mountpoint = /var/lib/postgres
+        size_limit = 500G
+    }
+    
+    filesystem objects {
+        mountpoint = /srv/objects
+        size_limit = 1T
+    }
+}
+```
+
+### SAN-Attached Multipath with iSCSI
+
+```
+iscsi san_target0 {
+    target = "iqn.2024.com.storage:array01.lun0"
+    portal = "10.0.1.50:3260"
+    portals = ["10.0.2.50:3260"]
+    auth = chap
+    username = "initiator01"
+    multipath = true
+}
+
+multipath san_lun0 {
+    wwid = "3600508b4000c4a37000009000012a000"
+    policy = service-time
+    no_path_retry = 12
+    
+    path /dev/sda { priority_group = 1 }
+    path /dev/sdb { priority_group = 1 }
+    path /dev/sdc { priority_group = 2 }
+    path /dev/sdd { priority_group = 2 }
+    
+    luks2 encrypted_san {
+        cipher = aes-xts-plain64
+        key_size = 512
+        tpm2 = true
+        
+        lvm vg_san {
+            vdo dedup_archive {
+                size = 2T
+                virtual_size = 8T
+                deduplication = true
+                compression = true
+                
+                xfs archive {
+                    mount = /srv/archive [nodev, nosuid, noexec]
+                }
+            }
+            
+            xfs hot_data {
+                size = 500G
+                mount = /srv/data [nodev, nosuid]
+            }
+        }
+    }
+}
+```
+
+### Hardened System with tmpfs and Integrity
+
+```
+tmpfs tmp {
+    mount = /tmp [nodev, nosuid, noexec] context system_u:object_r:tmp_t:s0
+    size = 2G
+}
+
+tmpfs devshm {
+    mount = /dev/shm [nodev, nosuid, noexec]
+    size = 1G
+}
+
+tmpfs run {
+    mount = /run [nodev, nosuid] context system_u:object_r:var_run_t:s0
+}
+
+disk /dev/nvme0n1 {
+    label = gpt
+    
+    fat32 efi {
+        index = 1
+        size = 1G
+        type = ef00
+        mount = /boot/efi [nodev, nosuid, noexec] context system_u:object_r:boot_t:s0
+    }
+    
+    ext4 boot {
+        index = 2
+        size = 1G
+        mount = /boot [nodev, nosuid, noexec]
+    }
+    
+    luks2 system {
+        index = 3
+        size = remaining
+        tpm2 = true
+        integrity = hmac-sha256
+        
+        lvm vg0 {
+            ext4 root { size = 50G; mount = / }
+            ext4 var { size = 30G; mount = /var [nodev, nosuid, noexec] }
+            ext4 home { size = 100G; mount = /home [nodev, nosuid] }
+            ext4 audit { size = 20G; mount = /var/log/audit [nodev, nosuid, noexec] }
+            swap swap0 { size = 16G }
+        }
+    }
+}
+
+nfs home_nfs {
+    server = "nfs.internal.example.com"
+    export = "/exports/shared"
+    version = 4.2
+    sec = krb5p
+    
+    mount {
+        target = /mnt/shared
+        options = [nodev, nosuid, noexec, hard, intr]
+        requires = [network-online.target, gssproxy.service]
+        context = system_u:object_r:nfs_t:s0
+    }
+}
+```
+
 ---
 
 ## Explicit Partition Positioning
@@ -992,16 +1785,35 @@ The compiler applies the following validation rules to storage declarations. All
 * A `disk` with `label = none` must have exactly one filesystem child.
 * A `luks2` block without a child `lvm` may contain at most one filesystem child (LUKS opens to a single block device).
 * `subvol` blocks are only valid inside `btrfs`.
-* `thin` blocks are only valid inside `lvm`.
+* `thin` and `vdo` blocks are only valid inside `lvm`.
 * `index` values within a `disk` must be unique and positive.
 * `mdraid` member disks must not appear in more than one array.
+* `zpool` vdev members must not appear in more than one vdev within the same pool.
+* `zpool` vdev member counts must meet minimums for their type: `mirror` ≥ 2, `raidz1` ≥ 3, `raidz2` ≥ 4, `raidz3` ≥ 5.
+* `dataset` blocks are only valid inside `zpool` or other `dataset` blocks.
+* `zvol` blocks are only valid inside `zpool`.
+* `vdev` blocks are only valid inside `zpool`.
+* `filesystem` (Stratis) blocks are only valid inside `stratis`.
+* `path` blocks are only valid inside `multipath`.
+* `multipath` `wwid` must be unique across all multipath declarations.
+* `nfs` blocks cannot contain children other than a `mount` block or inline mount expression.
+* `iscsi` `target` + `portal` combinations must be unique.
+* `integrity` blocks inside `luks2` are invalid — use the `integrity` property on the LUKS block instead.
+* `tmpfs` blocks must declare a `mount`.
+* `stratis` pools with `encrypted = true` must have a `key_desc` or use the pool name as default.
 
 ### Capacity Validation
 
 * The sum of `size` values for thick LVM logical volumes must not exceed the parent volume group's available physical extents. **Error.**
 * Thin pool virtual allocation exceeding `overcommit_warn` threshold. **Warning.**
 * Thin pool virtual allocation exceeding `overcommit_deny` threshold. **Error.**
+* VDO `virtual_size` must be greater than or equal to `size`. **Error.**
+* VDO physical `size` must be at least `5G`. **Error.**
+* VDO `slab_size` must be a power of 2 between `128M` and `32G`. **Error.**
+* VDO virtual allocation exceeding `overcommit_warn` threshold. **Warning.**
 * `start`/`end` values exceeding device capacity (when detectable). **Error.**
+* `zpool` `zvol` total `size` declarations should not exceed total pool capacity (best-effort estimate accounting for vdev overhead). **Warning** when exceeding 80%; **Error** at 100%.
+* `stratis` `filesystem` `size_limit` declarations exceeding total pool capacity. **Warning.**
 
 ### SELinux Context Validation
 
@@ -1021,9 +1833,9 @@ The compiler applies the following validation rules to storage declarations. All
 The compiler enforces a configurable security floor on storage declarations:
 
 * **Baseline:** No enforcement — the operator's declaration is accepted as-is.
-* **Standard:** `/boot` must have `nodev, nosuid, noexec`. `/tmp` must have `nodev, nosuid, noexec`. `/home` must have `nodev, nosuid`. Warnings for violations. Under MLS: warnings for mounts without SELinux context declarations.
-* **Strict:** Standard rules as errors, not warnings. Root filesystem must be on an encrypted backing device (`luks2` ancestor). Swap must be on an encrypted backing device. Under MLS: xattr-incapable filesystems must have explicit `context`. All mounts should have either `context` or `defcontext` — missing labels are **warnings**.
-* **Maximum:** Strict rules plus: all non-root mounts must have `nodev`. All mounts except `/` and `/boot` must have `nosuid`. All data-only mounts must have `noexec`. Under MLS: **every** mount must have an explicit SELinux context declaration (`context` for non-xattr, `defcontext` or `rootcontext` for xattr-capable). Missing labels are **errors**. `context` on xattr-capable filesystems is an **error** (must use `defcontext`/`rootcontext` to preserve per-file labeling).
+* **Standard:** `/boot` must have `nodev, nosuid, noexec`. `/tmp` must have `nodev, nosuid, noexec`. `/home` must have `nodev, nosuid`. `tmpfs` mounts for `/tmp` and `/dev/shm` must have `nodev, nosuid, noexec`. NFS mounts should use `hard` (soft mount produces a **warning**). Warnings for violations. Under MLS: warnings for mounts without SELinux context declarations.
+* **Strict:** Standard rules as errors, not warnings. Root filesystem must be on an encrypted backing device (`luks2` ancestor). Swap must be on an encrypted backing device. `tmpfs` blocks without SELinux `context` are **errors** under MLS. iSCSI connections should use CHAP authentication — `auth = none` produces a **warning**. NFS mounts should use `sec = krb5i` or above — `sec = sys` produces a **warning**. Under MLS: xattr-incapable filesystems must have explicit `context`. All mounts should have either `context` or `defcontext` — missing labels are **warnings**.
+* **Maximum:** Strict rules plus: all non-root mounts must have `nodev`. All mounts except `/` and `/boot` must have `nosuid`. All data-only mounts must have `noexec`. iSCSI connections must use CHAP — `auth = none` is an **error**. NFS mounts must use `sec = krb5p` — anything less is an **error**. Under MLS: **every** mount must have an explicit SELinux context declaration (`context` for non-xattr, `defcontext` or `rootcontext` for xattr-capable). Missing labels are **errors**. `context` on xattr-capable filesystems is an **error** (must use `defcontext`/`rootcontext` to preserve per-file labeling).
 
 The security floor level is declared outside the storage block (system-level configuration).
 
@@ -1054,7 +1866,7 @@ However, this approaches the complexity threshold where the extended form is mor
 
 The following words are reserved in storage context and cannot be used as block names:
 
-`disk`, `mdraid`, `luks2`, `luks1`, `lvm`, `thin`, `ext4`, `xfs`, `btrfs`, `fat32`, `swap`, `ntfs`, `raw`, `subvol`, `mount`, `remaining`, `none`, `whole`, `true`, `false`, `context`, `fscontext`, `defcontext`, `rootcontext`
+`disk`, `mdraid`, `zpool`, `vdev`, `dataset`, `zvol`, `stratis`, `filesystem`, `multipath`, `path`, `iscsi`, `nfs`, `luks2`, `luks1`, `integrity`, `lvm`, `thin`, `vdo`, `ext4`, `xfs`, `btrfs`, `fat32`, `swap`, `ntfs`, `tmpfs`, `raw`, `subvol`, `mount`, `remaining`, `none`, `whole`, `true`, `false`, `context`, `fscontext`, `defcontext`, `rootcontext`
 
 ---
 
@@ -1063,7 +1875,8 @@ The following words are reserved in storage context and cannot be used as block 
 This section provides an informal summary of the storage grammar for readability. The canonical grammar is the PEG definition in the compiler source.
 
 ```
-storage_decl    = (disk_block | mdraid_block)*
+storage_decl    = (disk_block | mdraid_block | zpool_block | stratis_block
+                | multipath_block | iscsi_block | nfs_block | tmpfs_block)*
 
 disk_block      = "disk" device_path "{" disk_body "}"
 disk_body       = property* (partition_block | fs_block | luks_block)*
@@ -1071,13 +1884,30 @@ disk_body       = property* (partition_block | fs_block | luks_block)*
 mdraid_block    = "mdraid" name "{" mdraid_body "}"
 mdraid_body     = property* (fs_block | luks_block | lvm_block)*
 
+zpool_block     = "zpool" name "{" property* (vdev_block | dataset_block | zvol_block)* "}"
+vdev_block      = "vdev" name "{" property* "}"
+dataset_block   = "dataset" name "{" property* dataset_block* "}"
+zvol_block      = "zvol" name "{" property* (swap_block | fs_block | luks_block)* "}"
+
+stratis_block   = "stratis" name "{" property* stratis_fs_block* "}"
+stratis_fs_block = "filesystem" name "{" property* "}"
+
+multipath_block = "multipath" name "{" property* path_block* (fs_block | luks_block | lvm_block | raw_block)* "}"
+path_block      = "path" device_path "{" property* "}"
+
+iscsi_block     = "iscsi" name "{" property* (fs_block | luks_block | lvm_block | raw_block)* "}"
+nfs_block       = "nfs" name "{" property* mount_block "}"
+tmpfs_block     = "tmpfs" name "{" property* "}"
+
 partition_block = (fs_keyword | "luks2" | "luks1" | "raw") name "{" partition_body "}"
 partition_body  = property* child_block*
 
 luks_block      = ("luks2" | "luks1") name "{" property* (fs_block | lvm_block) "}"
+integrity_block = "integrity" name "{" property* (fs_block | lvm_block | swap_block) "}"
 
-lvm_block       = "lvm" name "{" property* (fs_block | swap_block | thin_block)* "}"
+lvm_block       = "lvm" name "{" property* (fs_block | swap_block | thin_block | vdo_block)* "}"
 thin_block      = "thin" name "{" property* (fs_block | swap_block)* "}"
+vdo_block       = "vdo" name "{" property* (fs_block | swap_block) "}"
 
 fs_block        = fs_keyword name "{" property* subvol_block* "}"
 fs_keyword      = "ext4" | "xfs" | "btrfs" | "fat32" | "ntfs"
