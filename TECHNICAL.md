@@ -18,13 +18,13 @@ The compiler's job is structural correctness and cross-domain validation: no con
 
 Ironclad operates across four modes spanning the full system lifecycle:
 
-**Build time** — The compiler parses Ironclad source, resolves the class hierarchy, performs structural and semantic validation, and emits backend artifacts. This is a pure static pipeline: source goes in, a bootc Containerfile, a Kickstart configuration, SELinux targeted policy, and a signed manifest come out.
+**Build time** — The compiler parses Ironclad source, resolves the class hierarchy, performs structural and semantic validation, and emits a build toolchain. The toolchain is a set of ordered bash scripts and supporting artifacts (SELinux policy modules, configuration files, the signed manifest) that transform a minimal ISO or bare environment into the declared system. This is a pure static pipeline: source goes in, executable build artifacts come out.
 
-**Install time** — The emitted Kickstart configuration drives Anaconda to partition disks, configure LUKS2 encryption, bind TPM2/Clevis, install the bootloader, and bootstrap the system from the bootc-managed OCI image. The signed intermediate manifest is written to the installed system.
+**Install time** — The emitted toolchain executes against a target: a certified minimal ISO (RHEL, AlmaLinux, Fedora), a debootstrapped base, or a bare disk for Linux From Scratch-style builds. The scripts handle partitioning, encryption, package installation, file placement, user creation, service configuration, SELinux policy loading, and bootloader setup — in the correct order, derived from the declared dependency graph. Tools like Kickstart, Anaconda, or debootstrap are called where appropriate, but the toolchain is the orchestrator, not any single external tool.
 
-**Runtime auditing** — The runtime agent, embedded in the image at build time, periodically compares live system state against the signed manifest. Drift is reported as structured output.
+**Runtime auditing** — The runtime agent, installed during build, periodically compares live system state against the signed manifest. Drift is reported as structured output.
 
-**Runtime maintenance** — When the system declaration changes, the compiler diffs the old and new ASTs and emits an Ansible playbook representing the delta. The playbook is applied atomically; the agent verifies convergence.
+**Runtime maintenance** — When the system declaration changes, the compiler diffs the old and new manifests and emits a delta toolchain — a set of scripts representing the minimum changes needed to move from the old state to the new state. The runtime agent verifies convergence after application.
 
 ---
 
@@ -32,11 +32,11 @@ Ironclad operates across four modes spanning the full system lifecycle:
 
 ### Atomicity
 
-Every state transition on an Ironclad-managed system is atomic. The system exists in the old declared state or the new declared state; no intermediate condition is observable. For image-based updates, bootc's transactional staging provides this guarantee. For runtime maintenance deltas, the generated Ansible playbook is structured for atomic application where the backend supports it, and the runtime agent verifies convergence before reporting success.
+Every state transition on an Ironclad-managed system is atomic. The system exists in the old declared state or the new declared state; no intermediate condition is observable. The emitted toolchain scripts are structured so that each phase either completes fully or rolls back. For runtime maintenance deltas, the delta toolchain is structured for atomic application where the underlying operations support it, and the runtime agent verifies convergence before reporting success.
 
 ### Immutability
 
-Ironclad defaults to the maximum immutability the target platform supports. On bootc-managed systems, the root filesystem is read-only. Mutable state is confined to paths that the declaration explicitly marks as writable. The compiler enforces this: a file declared on a read-only filesystem without a corresponding writable overlay is a compile-time error. The runtime agent treats any modification to an immutable path as drift. Mutability is never prohibited — it is required to be explicit.
+Ironclad defaults to the maximum immutability the target platform supports. When the build target supports read-only roots (e.g., via `mount -o ro`, overlayfs, or dm-verity), the compiler emits the toolchain steps to enforce it. Mutable state is confined to paths that the declaration explicitly marks as writable. The compiler enforces this: a file declared on a read-only filesystem without a corresponding writable overlay or bind mount is a compile-time error. The runtime agent treats any modification to an immutable path as drift. Mutability is never prohibited — it is required to be explicit.
 
 ---
 
@@ -162,23 +162,68 @@ The compiler serializes the resolved AST into a signed intermediate manifest per
 
 ### Stage 5 — Backend Emission
 
-The compiler emits artifacts for each system in the declaration:
+The compiler emits a build toolchain and supporting artifacts for each system in the declaration. The toolchain is a set of ordered bash scripts that call standard Linux tools (`parted`, `cryptsetup`, `mkfs.*`, `mount`, `dnf`, `useradd`, `chown`, `chmod`, `restorecon`, `nft`, `systemctl`, `grub2-install`, etc.) to realize the declared system. The compiler generates each script from the resolved AST in dependency order.
 
-**bootc Containerfile** — Realizes the declared filesystem as an OCI image. Every declared file, directory, permission, label, and package is expressed as Containerfile instructions. The root filesystem is configured as read-only by default; declared mutable paths are realized as writable overlays or bind mounts. The signed manifest is embedded in the image.
+#### Toolchain Scripts
 
-**Kickstart configuration** — Covers disk partitioning, LUKS2, LVM, TPM2/Clevis binding, bootloader installation, and kernel command-line parameters. The `%post` section is generated and minimal; complex configuration lives in the image.
+The build toolchain is organized into ordered phases:
 
-**SELinux targeted policy** — The compiler analyzes the fully resolved AST — every declared file, service, user, network interface, and their labels — and generates correct `.te`, `.fc`, and `.if` policy modules using the Reference Policy as a foundation. See the SELinux section below.
+1. **Storage setup** — Partitioning, RAID assembly, LUKS formatting, LVM creation, filesystem creation, mount ordering. Calls `parted`, `mdadm`, `cryptsetup`, `pvcreate`/`lvcreate`, `mkfs.*`, `mount`.
 
-**Service artifacts** — For `init systemd` declarations, the compiler generates unit files, drop-in directories, and target dependencies. For `init s6` declarations, the compiler generates service directories, run scripts, and s6-rc source definitions.
+2. **Base installation** — Package installation from the declared set. The method depends on the build target:
+   - *Minimal ISO*: Calls Kickstart/Anaconda for initial package installation when starting from a certified ISO, or `dnf --installroot` for chroot-based builds. The ISO's certification chain is preserved — packages come from the ISO's signed repositories.
+   - *Network install*: Calls `dnf --installroot` against declared repositories.
+   - *Linux From Scratch*: Emits the full tool invocation sequence for building from source (future target).
 
-**Firewall ruleset** — The compiler generates `/etc/nftables.conf` from the declared firewall tables, chains, and rules.
+3. **File placement** — Creates directories, writes files, sets permissions, ownership, and extended attributes. Calls `mkdir`, `install`, `chown`, `chmod`, `chattr`.
 
-**Network configuration** — The compiler generates backend-appropriate network configuration (NetworkManager keyfiles, systemd-networkd units, or legacy ifcfg scripts) from the declared interfaces.
+4. **User and group creation** — Creates users and groups with declared properties. Calls `groupadd`, `useradd`, `usermod`, `chpasswd`, `chage`.
 
-Everything outside the compiler's native scope — bootloader configuration, secrets backend setup, Kubernetes manifests, libvirt XML, Podman Quadlet files, and other subsystem-specific files — is emitted by standard library classes as declared files. The compiler places them in the image through the Containerfile without needing to understand their formats.
+5. **Service configuration** — Writes and enables service artifacts. For `init systemd`: generates unit files, drop-in directories, enables targets. For `init s6`: generates service directories, run scripts, s6-rc source definitions.
 
-For topologies, the compiler emits a Containerfile, Kickstart configuration, and SELinux policy per system, plus any topology-level artifacts (deployment ordering, cross-system configuration distribution).
+6. **Network configuration** — Writes backend-appropriate network configuration (NetworkManager keyfiles, systemd-networkd units, or legacy ifcfg scripts).
+
+7. **Firewall** — Writes `/etc/nftables.conf` from the declared firewall rules.
+
+8. **SELinux policy** — Compiles and loads generated `.te`, `.fc`, and `.if` policy modules, runs `restorecon` across the filesystem tree. See the SELinux section below.
+
+9. **Bootloader** — Stdlib-emitted bootloader configuration is written; the toolchain calls `grub2-install`, `bootctl install`, or equivalent.
+
+10. **Manifest installation** — Writes the signed intermediate manifest to the system for the runtime agent.
+
+11. **Cleanup and seal** — Unmounts filesystems, sets immutable bits, configures read-only root if declared.
+
+Each phase is a standalone bash script that can be inspected, modified, or executed independently. The toolchain also emits a top-level orchestrator script that runs the phases in order.
+
+#### Supporting Artifacts
+
+In addition to the toolchain scripts, the compiler emits:
+
+**SELinux targeted policy** — `.te`, `.fc`, and `.if` policy modules generated from the resolved AST. See the SELinux section below.
+
+**Service unit files** — systemd units, s6 service directories, and associated configuration files.
+
+**Firewall ruleset** — `/etc/nftables.conf` content.
+
+**Network configuration** — Backend-specific config files.
+
+**Stdlib-emitted files** — Configuration files produced by standard library classes (bootloader configs, secrets backend setup, Kubernetes manifests, etc.) are written to a staging directory by the compiler. The file placement phase copies them to their declared paths.
+
+#### Build Targets
+
+The compiler supports multiple build targets, selected via `Ironclad.toml` or command-line flag:
+
+| Target        | Description                                                                                    |
+|---------------|------------------------------------------------------------------------------------------------|
+| `iso`         | Build from a certified minimal ISO. Preserves ISO certification chain. Uses Kickstart/Anaconda for initial bootstrap, then the toolchain for everything else. This is the primary target for environments requiring ISO certification (government, defense, regulated industries). |
+| `chroot`      | Build into a chroot directory using `dnf --installroot`. No ISO required. Suitable for development, testing, and environments without certification requirements. |
+| `image`       | Build an OCI container image via bootc Containerfile. For container-native and image-based deployments. |
+| `bare`        | Emit the full toolchain for execution on a bare disk. For Linux From Scratch-style builds or heavily customized environments. |
+| `delta`       | Emit a delta toolchain from an old manifest to the current declaration. For runtime maintenance of existing systems. |
+
+The `iso` target is the default and the design center. The toolchain calls Kickstart/Anaconda minimally — for disk partitioning and initial package installation from the ISO — then takes over for all subsequent configuration. This preserves the ISO's signed package chain and certification status while allowing arbitrary system customization.
+
+For topologies, the compiler emits a toolchain per system, plus any topology-level artifacts (deployment ordering, cross-system configuration distribution, shared secrets).
 
 ---
 
@@ -196,9 +241,9 @@ Generated policy is fully inspectable and overridable. Engineers can review the 
 
 ## Runtime Agent
 
-The runtime agent is a statically-linked Rust binary embedded in every Ironclad-built image. It reads the signed manifest, verifies its signature, and periodically compares declared state against live system state. The checked property set includes file content hashes, permissions, ownership, and SELinux labels on all declared paths; user and group declarations; and any other filesystem state recorded in the manifest.
+The runtime agent is a statically-linked Rust binary installed on every Ironclad-built system by the toolchain. It reads the signed manifest, verifies its signature, and periodically compares declared state against live system state. The checked property set includes file content hashes, permissions, ownership, and SELinux labels on all declared paths; user and group declarations; and any other filesystem state recorded in the manifest.
 
-Drift is reported as structured JSON to configurable sinks (local file, syslog, remote endpoint). The agent performs detection and reporting only — no remediation. Remediation is the responsibility of the maintenance pipeline: AST delta → Ansible playbook → agent verification of convergence. The verification step is what closes an atomic transition; until the agent confirms convergence, the transition is considered in progress.
+Drift is reported as structured JSON to configurable sinks (local file, syslog, remote endpoint). The agent performs detection and reporting only — no remediation. Remediation is the responsibility of the maintenance pipeline: the compiler emits a delta toolchain from the old manifest to the new declaration, the delta scripts are applied, and the agent verifies convergence. The verification step is what closes an atomic transition; until the agent confirms convergence, the transition is considered in progress.
 
 ---
 
@@ -208,6 +253,16 @@ Ironclad enforces a non-negotiable security floor: SELinux in enforcing mode, LU
 
 ---
 
-## Build and Image Model
+## Build Model
 
-Ironclad-built images are OCI-compliant container images managed by bootc. The image contains the complete declared system as an immutable artifact. Updates follow bootc's transactional model: the new image is staged alongside the running system and activated atomically on reboot. Failed boots trigger automatic rollback. For environments without OCI infrastructure, the compiler can target osbuild's blueprint format as an alternative backend.
+Ironclad's build model is toolchain-based, not image-based. The compiler emits bash scripts that call standard Linux tools to transform a base environment into the declared system. This design has several consequences:
+
+**ISO certification is preserved.** When building from a certified minimal ISO (RHEL, AlmaLinux), the toolchain uses the ISO's own installer for package installation, preserving the signed package chain. All subsequent customization is performed by the toolchain scripts, which are auditable, deterministic, and do not break the certification chain because they use the same tools an administrator would use manually.
+
+**The build is inspectable end-to-end.** Every script the compiler emits is a readable bash file. An auditor can read exactly what the system will do, in what order, with what arguments. There is no opaque build engine or container layer — the toolchain is the build.
+
+**Multiple entry points are supported.** The same declaration can target a certified ISO, a chroot, an OCI image, or a bare disk. The compiler adjusts the toolchain's bootstrap phase for the target, but the configuration phases are identical regardless of entry point.
+
+**Heavy modification is possible.** Because the toolchain is bash scripts calling standard tools, there is no ceiling on what can be customized. The toolchain can partition disks with arbitrary layouts, compile kernel modules, build software from source, apply binary patches, or perform any operation expressible in a shell. The structured syntax covers the common cases; the `raw` escape hatch covers everything else.
+
+**Updates are delta toolchains.** When the declaration changes, the compiler emits a delta toolchain — the minimum set of scripts to move from the old manifest to the new state. This is not a full rebuild; it is a targeted set of operations (add a user, change a firewall rule, update a package, relabel a directory) that the runtime agent verifies for convergence.
