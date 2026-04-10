@@ -137,7 +137,7 @@ MLS policy generation is a long-term compiler goal. In the interim, organization
 
 ## Status & Version
 
-**Pre-alpha v0.0.1** — concept and architecture phase. This repository contains the project vision, architectural documentation, and initial scaffolding. Alpha development begins at 0.1.0 with the core parser and grammar.
+**Pre-alpha v0.0.2** — concept and architecture phase. This repository contains the project vision, architectural documentation, and initial scaffolding. Alpha development begins at 0.1.0 with the core parser and grammar.
 
 ---
 
